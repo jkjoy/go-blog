@@ -1,0 +1,714 @@
+package blog
+
+import (
+	"encoding/xml"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/mail"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"golang.org/x/text/unicode/norm"
+)
+
+func (a *App) baseData(c echo.Context, title string) (PageData, error) {
+	settings, err := a.repo.Settings()
+	if err != nil {
+		return PageData{}, err
+	}
+	pages, err := a.repo.NavPages()
+	if err != nil {
+		return PageData{}, err
+	}
+	data := PageData{
+		Title: title, Description: settings.Description, Settings: settings, NavPages: pages,
+		User: currentUser(c), Version: a.version,
+	}
+	if c.QueryParam("comment") == "submitted" {
+		data.Notice = "submitted"
+	}
+	if c.QueryParam("saved") == "1" {
+		data.Notice = "saved"
+	}
+	if claims, ok := c.Get("claims").(sessionClaims); ok {
+		data.CSRF = a.auth.CSRF(claims)
+	}
+	return data, nil
+}
+
+func (a *App) render(c echo.Context, status int, name string, data PageData) error {
+	c.Response().Header().Set(echo.HeaderContentType, echo.MIMETextHTMLCharsetUTF8)
+	c.Response().WriteHeader(status)
+	return a.templates.ExecuteTemplate(c.Response(), name, data)
+}
+
+func (a *App) home(c echo.Context) error {
+	page := 1
+	if raw := c.Param("page"); raw != "" {
+		page, _ = strconv.Atoi(raw)
+	}
+	if page < 1 {
+		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
+	}
+	data, err := a.baseData(c, "")
+	if err != nil {
+		return err
+	}
+	total, err := a.repo.CountPublished()
+	if err != nil {
+		return err
+	}
+	totalPages := int(math.Ceil(float64(total) / float64(data.Settings.PostsPerPage)))
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	if page > totalPages {
+		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
+	}
+	posts, err := a.repo.ListPublished(data.Settings.PostsPerPage, (page-1)*data.Settings.PostsPerPage)
+	if err != nil {
+		return err
+	}
+	a.decoratePosts(posts)
+	data.View, data.Title, data.Posts, data.Total, data.Page, data.TotalPages = "home", data.Settings.Name, posts, total, page, totalPages
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) post(c echo.Context) error {
+	rawIdentifier := decodedPathParam(c, "slug")
+	identifier := norm.NFC.String(rawIdentifier)
+	post, err := a.repo.FindContent("post", identifier, currentUser(c) != nil)
+	if IsNotFound(err) {
+		return echo.NewHTTPError(http.StatusNotFound, "文章不存在")
+	}
+	if err != nil {
+		return err
+	}
+	if rawIdentifier != identifier {
+		return c.Redirect(http.StatusMovedPermanently, contentURL(post))
+	}
+	data, err := a.baseData(c, post.Title)
+	if err != nil {
+		return err
+	}
+	post.Rendered = string(a.markdown.Render(post.Content))
+	post.CoverURL = PostCover(post.Content)
+	comments, err := a.repo.Comments(post.ID, currentUser(c) == nil)
+	if err != nil {
+		return err
+	}
+	data.View, data.Post, data.Comments = "post", post, comments
+	data.CommentCount = countComments(comments)
+	data.CanComment = data.Settings.Comments && post.AllowComments && post.Status == "published" && post.PublishedAt <= time.Now().Unix()
+	data.Description = DeriveExcerpt(post, 160)
+	if post.Status == "published" {
+		_ = a.repo.TrackView(post.ID, a.auth.IPHash(clientIP(c.Request())))
+	}
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) page(c echo.Context) error {
+	rawSlug := decodedPathParam(c, "slug")
+	slug := norm.NFC.String(rawSlug)
+	reserved := map[string]bool{"static": true, "healthz": true, "admin": true, "login": true, "logout": true}
+	if reserved[slug] {
+		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
+	}
+	post, err := a.repo.FindContent("page", slug, currentUser(c) != nil)
+	if IsNotFound(err) {
+		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
+	}
+	if err != nil {
+		return err
+	}
+	if rawSlug != slug {
+		return c.Redirect(http.StatusMovedPermanently, contentURL(post))
+	}
+	data, err := a.baseData(c, post.Title)
+	if err != nil {
+		return err
+	}
+	post.Rendered = string(a.markdown.Render(post.Content))
+	data.View, data.Post = "page", post
+	data.Comments, err = a.repo.Comments(post.ID, currentUser(c) == nil)
+	if err != nil {
+		return err
+	}
+	data.CommentCount = countComments(data.Comments)
+	data.CanComment = data.Settings.Comments && post.AllowComments && post.Status == "published" && post.PublishedAt <= time.Now().Unix()
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) archives(c echo.Context) error {
+	data, err := a.baseData(c, "归档")
+	if err != nil {
+		return err
+	}
+	posts, err := a.repo.AllPublished()
+	if err != nil {
+		return err
+	}
+	a.decoratePosts(posts)
+	groups := map[int][]Post{}
+	for _, post := range posts {
+		groups[post.PublishedTime().Year()] = append(groups[post.PublishedTime().Year()], post)
+	}
+	years := make([]int, 0, len(groups))
+	for year := range groups {
+		years = append(years, year)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(years)))
+	for _, year := range years {
+		data.Years = append(data.Years, ArchiveYear{Year: year, Posts: groups[year]})
+	}
+	data.View, data.Posts, data.Total = "archives", posts, len(posts)
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) tags(c echo.Context) error {
+	data, err := a.baseData(c, "标签")
+	if err != nil {
+		return err
+	}
+	data.Tags, err = a.repo.Tags()
+	if err != nil {
+		return err
+	}
+	data.View = "tags"
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) tag(c echo.Context) error {
+	slug := norm.NFC.String(decodedPathParam(c, "slug"))
+	posts, label, err := a.repo.PostsByTag(slug)
+	if err != nil {
+		return err
+	}
+	if label == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "标签不存在")
+	}
+	data, err := a.baseData(c, "# "+label)
+	if err != nil {
+		return err
+	}
+	a.decoratePosts(posts)
+	data.View, data.Posts, data.Tag = "timeline", posts, Tag{Label: label, Slug: slug, Count: len(posts)}
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) category(c echo.Context) error {
+	posts, category, err := a.repo.PostsByCategory(norm.NFC.String(decodedPathParam(c, "slug")))
+	if IsNotFound(err) {
+		return echo.NewHTTPError(http.StatusNotFound, "分类不存在")
+	}
+	if err != nil {
+		return err
+	}
+	data, err := a.baseData(c, category.Name)
+	if err != nil {
+		return err
+	}
+	a.decoratePosts(posts)
+	data.View, data.Posts, data.Category = "timeline", posts, category
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func decodedPathParam(c echo.Context, name string) string {
+	value := c.Param(name)
+	if c.Request().URL.RawPath == "" {
+		return value
+	}
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func (a *App) links(c echo.Context) error {
+	data, err := a.baseData(c, "友链")
+	if err != nil {
+		return err
+	}
+	data.Links, err = a.repo.Links()
+	if err != nil {
+		return err
+	}
+	data.View = "links"
+	return a.render(c, http.StatusOK, "public", data)
+}
+
+func (a *App) decoratePosts(posts []Post) {
+	for i := range posts {
+		posts[i].CoverURL = PostCover(posts[i].Content)
+		posts[i].Excerpt = DeriveExcerpt(posts[i], 100)
+	}
+}
+
+func (a *App) submitComment(c echo.Context) error {
+	postID := parseID(c.FormValue("post_id"))
+	post, err := a.repo.FindPostByID(postID)
+	if err != nil || !post.AllowComments || a.repo.Setting("comments_enabled") == "0" || post.Status != "published" || post.PublishedAt > time.Now().Unix() {
+		return echo.NewHTTPError(http.StatusBadRequest, "这篇内容不接受评论")
+	}
+	comment := Comment{
+		PostID: postID, ParentID: parseID(c.FormValue("parent_id")),
+		AuthorName: strings.TrimSpace(c.FormValue("author_name")), AuthorEmail: strings.TrimSpace(c.FormValue("author_email")),
+		AuthorURL: strings.TrimSpace(c.FormValue("author_url")), Content: strings.TrimSpace(c.FormValue("content")),
+	}
+	if user := currentUser(c); user != nil {
+		comment.UserID, comment.AuthorName, comment.AuthorEmail, comment.AuthorURL = user.ID, user.DisplayName(), user.Email, user.WebsiteURL
+	}
+	if len([]rune(comment.AuthorName)) < 1 || len([]rune(comment.AuthorName)) > 50 {
+		return echo.NewHTTPError(http.StatusBadRequest, "昵称长度应为 1 至 50 个字符")
+	}
+	if _, err := mail.ParseAddress(comment.AuthorEmail); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "邮箱格式不正确")
+	}
+	if len([]rune(comment.Content)) < 2 || len([]rune(comment.Content)) > 3000 {
+		return echo.NewHTTPError(http.StatusBadRequest, "评论长度应为 2 至 3000 个字符")
+	}
+	if comment.AuthorURL != "" {
+		parsed, err := url.ParseRequestURI(comment.AuthorURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return echo.NewHTTPError(http.StatusBadRequest, "网站地址格式不正确")
+		}
+	}
+	if comment.ParentID > 0 {
+		var parentPost int64
+		if err := a.database.QueryRow("SELECT post_id FROM comments WHERE id=?", comment.ParentID).Scan(&parentPost); err != nil || parentPost != postID {
+			return echo.NewHTTPError(http.StatusBadRequest, "回复目标不存在")
+		}
+	}
+	ip := clientIP(c.Request())
+	if err := a.repo.CreateComment(comment, a.auth.IPHash(ip), ip, c.Request().UserAgent(), a.repo.CommentApprovalRequired()); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, contentURL(post)+"?comment=submitted#comments")
+}
+
+func (a *App) loginPage(c echo.Context) error {
+	if currentUser(c) != nil {
+		return c.Redirect(http.StatusSeeOther, "/admin")
+	}
+	data, err := a.baseData(c, "登录")
+	if err != nil {
+		return err
+	}
+	data.View = "login"
+	return a.render(c, http.StatusOK, "auth", data)
+}
+
+func (a *App) login(c echo.Context) error {
+	user, err := a.repo.UserByUsername(strings.TrimSpace(c.FormValue("username")))
+	if err != nil || !a.auth.PasswordMatches(user.PasswordHash, c.FormValue("password")) {
+		data, dataErr := a.baseData(c, "登录")
+		if dataErr != nil {
+			return dataErr
+		}
+		data.View, data.Error = "login", "用户名或密码不正确"
+		return a.render(c, http.StatusUnauthorized, "auth", data)
+	}
+	if err := a.auth.SetSession(c.Response(), user.ID); err != nil {
+		return err
+	}
+	next := c.QueryParam("next")
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		next = "/admin"
+	}
+	return c.Redirect(http.StatusSeeOther, next)
+}
+
+func (a *App) logout(c echo.Context) error {
+	if claims, ok := c.Get("claims").(sessionClaims); ok && !a.auth.ValidCSRF(claims, c.FormValue("csrf")) {
+		return echo.NewHTTPError(http.StatusForbidden, "请求校验失败")
+	}
+	a.auth.ClearSession(c.Response())
+	return c.Redirect(http.StatusSeeOther, "/")
+}
+
+func (a *App) adminDashboard(c echo.Context) error {
+	data, err := a.baseData(c, "管理")
+	if err != nil {
+		return err
+	}
+	data.Stats, err = a.repo.Dashboard()
+	if err != nil {
+		return err
+	}
+	data.View = "dashboard"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) adminPosts(c echo.Context) error {
+	data, err := a.baseData(c, "内容管理")
+	if err != nil {
+		return err
+	}
+	data.Posts, err = a.repo.AdminPosts()
+	if err != nil {
+		return err
+	}
+	data.View = "posts"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) adminComments(c echo.Context) error {
+	data, err := a.baseData(c, "评论管理")
+	if err != nil {
+		return err
+	}
+	data.AdminComments, err = a.repo.AdminComments()
+	if err != nil {
+		return err
+	}
+	data.View = "comments"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) moderateComment(c echo.Context) error {
+	if err := a.repo.ModerateComment(parseID(c.Param("id")), c.FormValue("action")); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/comments")
+}
+
+func (a *App) adminCategories(c echo.Context) error {
+	data, err := a.baseData(c, "分类管理")
+	if err != nil {
+		return err
+	}
+	data.Categories, err = a.repo.Categories()
+	if err != nil {
+		return err
+	}
+	data.View = "categories"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) saveCategory(c echo.Context) error {
+	sortOrder, _ := strconv.Atoi(c.FormValue("sort_order"))
+	category := Category{ID: parseID(c.FormValue("id")), Name: strings.TrimSpace(c.FormValue("name")), Slug: slugify(c.FormValue("slug")), Description: strings.TrimSpace(c.FormValue("description")), SortOrder: sortOrder}
+	if category.Name == "" {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "分类名称不能为空")
+	}
+	if category.Slug == "" {
+		category.Slug = slugify(category.Name)
+	}
+	if err := a.repo.SaveCategory(category); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/categories")
+}
+
+func (a *App) deleteCategory(c echo.Context) error {
+	if err := a.repo.DeleteCategory(parseID(c.Param("id"))); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/categories")
+}
+
+func (a *App) adminLinks(c echo.Context) error {
+	data, err := a.baseData(c, "友链管理")
+	if err != nil {
+		return err
+	}
+	data.Links, err = a.repo.Links()
+	if err != nil {
+		return err
+	}
+	data.View = "admin-links"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) saveLink(c echo.Context) error {
+	sortOrder, _ := strconv.Atoi(c.FormValue("sort_order"))
+	link := Link{ID: parseID(c.FormValue("id")), Name: strings.TrimSpace(c.FormValue("name")), URL: strings.TrimSpace(c.FormValue("url")), IconURL: strings.TrimSpace(c.FormValue("icon_url")), Description: strings.TrimSpace(c.FormValue("description")), SortOrder: sortOrder}
+	parsed, err := url.ParseRequestURI(link.URL)
+	if link.Name == "" || err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "请填写名称和有效的友链地址")
+	}
+	if err := a.repo.SaveLink(link); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/links")
+}
+
+func (a *App) deleteLink(c echo.Context) error {
+	if err := a.repo.DeleteLink(parseID(c.Param("id"))); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/links")
+}
+
+func (a *App) adminSettings(c echo.Context) error {
+	data, err := a.baseData(c, "站点设置")
+	if err != nil {
+		return err
+	}
+	data.View = "settings"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) saveSettings(c echo.Context) error {
+	perPage, _ := strconv.Atoi(c.FormValue("posts_per_page"))
+	if perPage < 1 || perPage > 100 {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "每页文章数应为 1 至 100")
+	}
+	values := map[string]string{
+		"site_name": strings.TrimSpace(c.FormValue("site_name")), "site_tagline": strings.TrimSpace(c.FormValue("site_tagline")),
+		"site_description": strings.TrimSpace(c.FormValue("site_description")), "site_keywords": strings.TrimSpace(c.FormValue("site_keywords")),
+		"site_footer": strings.TrimSpace(c.FormValue("site_footer")), "footer_beian": strings.TrimSpace(c.FormValue("footer_beian")),
+		"favicon_url": strings.TrimSpace(c.FormValue("favicon_url")), "posts_per_page": strconv.Itoa(perPage),
+		"comments_enabled": checkboxValue(c.FormValue("comments_enabled")), "comments_require_approval": checkboxValue(c.FormValue("comments_require_approval")), "pretty_url": "1",
+	}
+	if values["site_name"] == "" {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "站点名称不能为空")
+	}
+	if err := a.repo.SavePublicSettings(values); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/settings?saved=1")
+}
+
+func checkboxValue(value string) string {
+	if value == "1" {
+		return "1"
+	}
+	return "0"
+}
+
+func (a *App) uploadAttachment(c echo.Context) error {
+	request := c.Request()
+	request.Body = http.MaxBytesReader(c.Response(), request.Body, 12<<20)
+	file, header, err := request.FormFile("file")
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "请选择不超过 10MB 的文件")
+	}
+	defer file.Close()
+
+	buffer := make([]byte, 512)
+	n, err := io.ReadFull(file, buffer)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return echo.NewHTTPError(http.StatusBadRequest, "无法读取文件")
+	}
+	mime := http.DetectContentType(buffer[:n])
+	extensions := map[string]string{
+		"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+		"application/pdf": ".pdf", "text/plain; charset=utf-8": ".txt",
+	}
+	ext, ok := extensions[mime]
+	if !ok {
+		return echo.NewHTTPError(http.StatusUnsupportedMediaType, "仅支持 JPG、PNG、GIF、WebP、PDF 和纯文本")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	token, err := randomToken(12)
+	if err != nil {
+		return err
+	}
+	year := strconv.Itoa(time.Now().Year())
+	directory := filepath.Join(a.cfg.UploadDir, year)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
+	name := token + ext
+	path := filepath.Join(directory, name)
+	target, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	written, copyErr := io.Copy(target, io.LimitReader(file, (10<<20)+1))
+	closeErr := target.Close()
+	if copyErr != nil || closeErr != nil || written > 10<<20 {
+		_ = os.Remove(path)
+		if copyErr != nil {
+			return copyErr
+		}
+		if written > 10<<20 {
+			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "文件不能超过 10MB")
+		}
+		return closeErr
+	}
+	return c.JSON(http.StatusCreated, map[string]string{"url": "/uploads/" + year + "/" + name, "name": header.Filename})
+}
+
+func (a *App) editor(c echo.Context) error {
+	data, err := a.baseData(c, "写作")
+	if err != nil {
+		return err
+	}
+	data.Categories, err = a.repo.Categories()
+	if err != nil {
+		return err
+	}
+	if id := parseID(c.Param("id")); id > 0 {
+		data.Post, err = a.repo.FindPostByID(id)
+		if IsNotFound(err) {
+			return echo.NewHTTPError(http.StatusNotFound, "内容不存在")
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		data.Post = Post{Kind: "post", Status: "draft", AllowComments: true, AuthorID: data.User.ID}
+	}
+	data.View = "editor"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) saveEditor(c echo.Context) error {
+	id := parseID(c.Param("id"))
+	post := Post{
+		ID: id, AuthorID: currentUser(c).ID, CategoryID: parseID(c.FormValue("category_id")),
+		Title: strings.TrimSpace(c.FormValue("title")), Slug: slugify(c.FormValue("slug")),
+		Excerpt: strings.TrimSpace(c.FormValue("excerpt")), Content: c.FormValue("content"),
+		Kind: c.FormValue("kind"), Status: c.FormValue("status"), Tags: ParseTags(c.FormValue("tags")),
+		Pinned: c.FormValue("is_pinned") == "1", AllowComments: c.FormValue("allow_comments") == "1",
+	}
+	if post.Slug == "" {
+		post.Slug = slugify(post.Title)
+	}
+	if id > 0 {
+		existing, err := a.repo.FindPostByID(id)
+		if err != nil {
+			return err
+		}
+		post.PublishedAt, post.CreatedAt, post.Views = existing.PublishedAt, existing.CreatedAt, existing.Views
+	}
+	if err := ValidatePost(post); err != nil {
+		data, dataErr := a.baseData(c, "写作")
+		if dataErr != nil {
+			return dataErr
+		}
+		data.View, data.Post, data.Error = "editor", post, err.Error()
+		data.Categories, _ = a.repo.Categories()
+		return a.render(c, http.StatusUnprocessableEntity, "admin", data)
+	}
+	postID, err := a.repo.SavePost(post)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+			return echo.NewHTTPError(http.StatusConflict, "Slug 已被其他内容使用")
+		}
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/edit/"+strconv.FormatInt(postID, 10)+"?saved=1")
+}
+
+func (a *App) deletePost(c echo.Context) error {
+	if err := a.repo.DeletePost(parseID(c.Param("id"))); err != nil {
+		return err
+	}
+	return c.Redirect(http.StatusSeeOther, "/admin/posts")
+}
+
+func (a *App) rss(c echo.Context) error {
+	settings, err := a.repo.Settings()
+	if err != nil {
+		return err
+	}
+	posts, err := a.repo.ListPublished(20, 0)
+	if err != nil {
+		return err
+	}
+	feed := rssFeed{Version: "2.0", Channel: rssChannel{Title: settings.Name, Link: absoluteURL(c, "/"), Description: settings.Description}}
+	for _, post := range posts {
+		feed.Channel.Items = append(feed.Channel.Items, rssItem{Title: post.Title, Link: absoluteURL(c, contentURL(post)), GUID: absoluteURL(c, contentURL(post)), PubDate: post.PublishedTime().Format(time.RFC1123Z), Description: DeriveExcerpt(post, 240)})
+	}
+	output, err := xml.MarshalIndent(feed, "", "  ")
+	if err != nil {
+		return err
+	}
+	return c.Blob(http.StatusOK, "application/rss+xml; charset=utf-8", append([]byte(xml.Header), output...))
+}
+
+func (a *App) sitemap(c echo.Context) error {
+	posts, err := a.repo.AllPublished()
+	if err != nil {
+		return err
+	}
+	pages, err := a.repo.NavPages()
+	if err != nil {
+		return err
+	}
+	set := sitemapSet{XMLNS: "http://www.sitemaps.org/schemas/sitemap/0.9"}
+	for _, path := range []string{"/", "/archives", "/tags", "/links"} {
+		set.URLs = append(set.URLs, sitemapURL{Loc: absoluteURL(c, path)})
+	}
+	for _, post := range append(posts, pages...) {
+		set.URLs = append(set.URLs, sitemapURL{Loc: absoluteURL(c, contentURL(post)), LastMod: time.Unix(post.UpdatedAt, 0).Format("2006-01-02")})
+	}
+	output, err := xml.MarshalIndent(set, "", "  ")
+	if err != nil {
+		return err
+	}
+	return c.Blob(http.StatusOK, "application/xml; charset=utf-8", append([]byte(xml.Header), output...))
+}
+
+type rssFeed struct {
+	XMLName xml.Name   `xml:"rss"`
+	Version string     `xml:"version,attr"`
+	Channel rssChannel `xml:"channel"`
+}
+type rssChannel struct {
+	Title       string    `xml:"title"`
+	Link        string    `xml:"link"`
+	Description string    `xml:"description"`
+	Items       []rssItem `xml:"item"`
+}
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	GUID        string `xml:"guid"`
+	PubDate     string `xml:"pubDate"`
+	Description string `xml:"description"`
+}
+type sitemapSet struct {
+	XMLName xml.Name     `xml:"urlset"`
+	XMLNS   string       `xml:"xmlns,attr"`
+	URLs    []sitemapURL `xml:"url"`
+}
+type sitemapURL struct {
+	Loc     string `xml:"loc"`
+	LastMod string `xml:"lastmod,omitempty"`
+}
+
+func contentURL(post Post) string {
+	if post.Kind == "page" {
+		return "/" + url.PathEscape(post.Slug)
+	}
+	return "/archive/" + url.PathEscape(post.Slug)
+}
+
+func absoluteURL(c echo.Context, path string) string {
+	scheme := c.Scheme()
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + c.Request().Host + path
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func countComments(comments []Comment) int {
+	total := 0
+	for _, comment := range comments {
+		total += 1 + countComments(comment.Children)
+	}
+	return total
+}
