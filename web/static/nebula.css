@@ -73,9 +73,10 @@ p, li, figcaption, blockquote { text-wrap: pretty; }
 .brand { max-width: 280px; overflow: hidden; color: var(--text); font-size: 17px; font-weight: 760; text-overflow: ellipsis; white-space: nowrap; }
 .brand::after { content: "."; color: var(--cyan); }
 .site-nav { margin-left: auto; display: flex; align-items: center; gap: 4px; }
-.site-nav a { min-height: 40px; display: inline-flex; align-items: center; padding: 0 12px; border-radius: 6px; color: var(--muted); font-size: 14px; transition-property: color, background-color; transition-duration: 150ms; transition-timing-function: ease-out; }
-.site-nav a:hover { color: var(--text); background: rgba(255,255,255,.06); }
-html[data-theme="light"] .site-nav a:hover { background: rgba(0,0,0,.05); }
+.site-nav a,.nav-logout button { min-height: 40px; display: inline-flex; align-items: center; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 14px; cursor: pointer; transition-property: color, background-color; transition-duration: 150ms; transition-timing-function: ease-out; }
+.site-nav a:hover,.nav-logout button:hover { color: var(--text); background: rgba(255,255,255,.06); }
+html[data-theme="light"] .site-nav a:hover,html[data-theme="light"] .nav-logout button:hover { background: rgba(0,0,0,.05); }
+.nav-logout { margin: 0; }
 .nav-actions { display: flex; align-items: center; gap: 6px; }
 .icon-button { position: relative; width: 42px; height: 42px; display: inline-grid; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; cursor: pointer; transition-property: color, background-color, scale, opacity; transition-duration: 150ms; transition-timing-function: ease-out; }
 .icon-button:hover { background: rgba(255,255,255,.07); }
@@ -252,7 +253,7 @@ textarea { resize: vertical; }
   .menu-toggle { display: grid; }
   .site-nav { position: fixed; top: 68px; left: 20px; right: 20px; display: grid; gap: 2px; padding: 10px; border-radius: 8px; background: var(--surface-solid); box-shadow: var(--shadow-hover); opacity: 0; pointer-events: none; transform: translateY(-10px); transition-property: opacity, transform; transition-duration: 180ms; transition-timing-function: ease-out; }
   .site-nav.open { opacity: 1; pointer-events: auto; transform: translateY(0); }
-  .site-nav a { min-height: 44px; }
+  .site-nav a,.nav-logout button { width: 100%; min-height: 44px; }
 }
 
 @media (max-width: 620px) {

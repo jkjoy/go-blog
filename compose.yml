@@ -16,6 +16,7 @@ services:
       BLOG_SCHEMA_MODE: ${BLOG_SCHEMA_MODE:-validate}
       BLOG_UPLOAD_DIR: /app/uploads
       BLOG_SESSION_SECRET: ${BLOG_SESSION_SECRET:?Set BLOG_SESSION_SECRET before starting}
+      BLOG_TRUSTED_PROXY: ${BLOG_TRUSTED_PROXY:-}
       BLOG_SECURE_COOKIES: ${BLOG_SECURE_COOKIES:-false}
       BLOG_LOG_LEVEL: ${BLOG_LOG_LEVEL:-info}
     volumes:

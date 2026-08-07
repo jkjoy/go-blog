@@ -22,12 +22,14 @@
 <a href="/admin/categories" class="{{if eq .View "categories"}}active{{end}}">分类</a>
 <a href="/admin/links" class="{{if eq .View "admin-links"}}active{{end}}">友链</a>
 <a href="/admin/settings" class="{{if eq .View "settings"}}active{{end}}">设置</a>
-<a href="/" target="_blank">查看站点</a>
 </nav>
+<div class="sidebar-account">
+<div class="sidebar-user"><span class="avatar">{{firstRune .User.DisplayName}}</span><span>{{.User.DisplayName}}</span></div>
 <form method="post" action="/logout">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <button class="ghost-button" type="submit">退出登录</button>
 </form>
+</div>
 </aside>
 <main class="admin-main">
 <header class="admin-topbar">
@@ -35,10 +37,7 @@
 <p class="eyebrow">CONTENT CONSOLE</p>
 <h1>{{.Title}}</h1>
 </div>
-<div class="admin-user">
-<span class="avatar">{{firstRune .User.DisplayName}}</span>
-<span>{{.User.DisplayName}}</span>
-</div>
+<a class="ghost-button admin-view-site" href="/" target="_blank" rel="noopener">查看站点</a>
 </header>
 {{if eq .View "dashboard"}}{{template "dashboard" .}}{{end}}{{if eq .View "posts"}}{{template "admin-posts" .}}{{end}}{{if eq .View "editor"}}{{template "editor" .}}{{end}}{{if eq .View "comments"}}{{template "admin-comments" .}}{{end}}{{if eq .View "categories"}}{{template "admin-categories" .}}{{end}}{{if eq .View "admin-links"}}{{template "admin-links" .}}{{end}}{{if eq .View "settings"}}{{template "settings" .}}{{end}}
 </main>
@@ -112,12 +111,13 @@
 <input type="hidden" name="csrf" value="{{.CSRF}}">{{if .Error}}<div class="form-error" role="alert">{{.Error}}</div>{{end}}{{if eq .Notice "saved"}}<div class="notice">内容已保存。</div>{{end}}<div class="editor-main">
 <label>标题<input name="title" value="{{.Post.Title}}" maxlength="200" required>
 </label>
-<label>Slug<input name="slug" value="{{.Post.Slug}}" maxlength="180" placeholder="article-slug">
+<label><span class="editor-field-heading"><span>Slug</span><button class="ghost-button ai-action" type="button" data-ai-action="slug" {{if not .AIReady}}disabled{{end}}>翻译 Slug</button></span><input name="slug" value="{{.Post.Slug}}" maxlength="180" placeholder="article-slug">
 </label>
-<label>摘要<textarea name="excerpt" rows="3" maxlength="500">{{.Post.Excerpt}}</textarea>
+<label><span class="editor-field-heading"><span>摘要</span><button class="ghost-button ai-action" type="button" data-ai-action="summary" {{if not .AIReady}}disabled{{end}}>生成摘要</button></span><textarea name="excerpt" rows="3" maxlength="500">{{.Post.Excerpt}}</textarea>
 </label>
-<label>正文<textarea class="content-editor" id="content-editor" name="content" rows="24" required>{{.Post.Content}}</textarea>
+<label><span class="editor-field-heading"><span>正文</span><button class="ghost-button ai-action" type="button" data-ai-action="polish" {{if not .AIReady}}disabled{{end}}>润色正文</button></span><textarea class="content-editor" id="content-editor" name="content" rows="24" required>{{.Post.Content}}</textarea>
 </label>
+<div class="ai-control" data-csrf="{{.CSRF}}" data-ready="{{if .AIReady}}1{{else}}0{{end}}"><span id="ai-status" role="status"></span></div>
 <div class="attachment-control" data-csrf="{{.CSRF}}">
 <label class="ghost-button" for="attachment-file">添加附件</label>
 <input id="attachment-file" type="file" accept="image/jpeg,image/png,image/gif,image/webp,application/pdf,text/plain">
@@ -246,6 +246,8 @@
 
 {{define "settings"}}{{if eq .Notice "saved"}}<div class="notice">设置已保存。</div>{{end}}<form class="settings-form settings-wide" method="post">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
+<section class="settings-group">
+<h2>站点</h2>
 <div class="settings-columns">
 <label>站点名称<input name="site_name" value="{{.Settings.Name}}" required>
 </label>
@@ -263,10 +265,82 @@
 </label>
 <label class="wide">备案号<input name="footer_beian" value="{{.Settings.Beian}}">
 </label>
+</div>
+</section>
+<section class="settings-group">
+<h2>评论与邮件</h2>
+<div class="settings-columns">
 <label class="check">
 <input type="checkbox" name="comments_enabled" value="1" {{if .Settings.Comments}}checked{{end}}>开启评论功能</label>
 <label class="check">
 <input type="checkbox" name="comments_require_approval" value="1" {{if .Settings.RequireApproval}}checked{{end}}>评论需要审核</label>
+<label class="check">
+<input type="checkbox" name="comments_notify" value="1" {{if .Settings.NotifyComments}}checked{{end}}>发送评论通知</label>
+<label class="check">
+<input type="checkbox" name="smtp_enabled" value="1" {{if .Mail.Enabled}}checked{{end}}>启用 SMTP</label>
+<label>SMTP 主机<input name="smtp_host" value="{{.Mail.Host}}" autocomplete="off">
+</label>
+<label>SMTP 端口<input type="number" min="1" max="65535" name="smtp_port" value="{{if .Mail.Port}}{{.Mail.Port}}{{end}}">
+</label>
+<label>加密方式<select name="smtp_encryption">
+<option value="starttls" {{if eq .Mail.Encryption "starttls"}}selected{{end}}>STARTTLS</option>
+<option value="ssl" {{if eq .Mail.Encryption "ssl"}}selected{{end}}>SSL</option>
+<option value="tls" {{if eq .Mail.Encryption "tls"}}selected{{end}}>TLS</option>
+<option value="none" {{if eq .Mail.Encryption "none"}}selected{{end}}>无</option>
+</select></label>
+<label>SMTP 用户名<input name="smtp_username" value="{{.Mail.Username}}" autocomplete="off">
+</label>
+<label>SMTP 密码<input type="password" name="smtp_password" autocomplete="new-password" placeholder="{{if .Mail.HasPassword}}已配置，留空保持不变{{end}}">
+</label>
+<label>发件邮箱<input type="email" name="smtp_from_email" value="{{.Mail.FromEmail}}">
+</label>
+<label>发件名称<input name="smtp_from_name" value="{{.Mail.FromName}}">
+</label>
+<label class="wide">通知邮箱<input type="email" name="smtp_notify_email" value="{{.Mail.NotifyEmail}}">
+</label>
 </div>
+</section>
+<section class="settings-group">
+<h2>S3 上传</h2>
+<div class="settings-columns">
+<label class="check">
+<input type="checkbox" name="s3_enabled" value="1" {{if .S3.Enabled}}checked{{end}}>启用 S3</label>
+<label class="check">
+<input type="checkbox" name="s3_keep_local" value="1" {{if .S3.KeepLocal}}checked{{end}}>保留本地副本</label>
+<label class="check">
+<input type="checkbox" name="s3_path_style" value="1" {{if .S3.PathStyle}}checked{{end}}>使用 Path-style</label>
+<label class="wide">Endpoint<input type="url" name="s3_endpoint" value="{{.S3.Endpoint}}" placeholder="https://">
+</label>
+<label>区域<input name="s3_region" value="{{.S3.Region}}">
+</label>
+<label>Bucket<input name="s3_bucket" value="{{.S3.Bucket}}">
+</label>
+<label class="wide">公开 URL<input type="url" name="s3_public_url" value="{{.S3.PublicURL}}" placeholder="https://">
+</label>
+<label>路径前缀<input name="s3_path_prefix" value="{{.S3.PathPrefix}}">
+</label>
+<label>Access Key<input type="password" name="s3_access_key" autocomplete="new-password" placeholder="{{if .S3.HasAccessKey}}已配置，留空保持不变{{end}}">
+</label>
+<label class="wide">Secret Key<input type="password" name="s3_secret_key" autocomplete="new-password" placeholder="{{if .S3.HasSecretKey}}已配置，留空保持不变{{end}}">
+</label>
+</div>
+</section>
+<section class="settings-group">
+<h2>AI 辅助</h2>
+<div class="settings-columns">
+<label class="wide">API URL<input type="url" name="ai_api_url" value="{{.AI.APIURL}}" placeholder="https://api.example.com/v1">
+</label>
+<label>模型<input name="ai_model" value="{{.AI.Model}}">
+</label>
+<label>API Key<input type="password" name="ai_api_key" autocomplete="new-password" placeholder="{{if .AI.HasAPIKey}}已配置，留空保持不变{{end}}">
+</label>
+<label class="wide">摘要提示词<textarea name="ai_summary_prompt" rows="4" maxlength="5000">{{.AI.SummaryPrompt}}</textarea>
+</label>
+<label class="wide">Slug 提示词<textarea name="ai_slug_prompt" rows="4" maxlength="5000">{{.AI.SlugPrompt}}</textarea>
+</label>
+<label class="wide">润色提示词<textarea name="ai_polish_prompt" rows="4" maxlength="5000">{{.AI.PolishPrompt}}</textarea>
+</label>
+</div>
+</section>
 <button class="primary-button" type="submit">保存设置</button>
 </form>{{end}}

@@ -12,12 +12,56 @@ type SiteSettings struct {
 	FaviconURL      string
 	PostsPerPage    int
 	Comments        bool
+	NotifyComments  bool
 	RequireApproval bool
 	PrettyURL       bool
 }
 
+type MailSettings struct {
+	Enabled     bool
+	Encryption  string
+	Host        string
+	Port        int
+	Username    string
+	Password    string
+	FromEmail   string
+	FromName    string
+	NotifyEmail string
+	HasPassword bool
+}
+
+type S3Settings struct {
+	Enabled      bool
+	Endpoint     string
+	Region       string
+	Bucket       string
+	AccessKey    string
+	SecretKey    string
+	PublicURL    string
+	PathPrefix   string
+	PathStyle    bool
+	KeepLocal    bool
+	HasAccessKey bool
+	HasSecretKey bool
+}
+
+type AISettings struct {
+	APIURL        string
+	APIKey        string
+	Model         string
+	SummaryPrompt string
+	SlugPrompt    string
+	PolishPrompt  string
+	HasAPIKey     bool
+}
+
+func (settings AISettings) Ready() bool {
+	return settings.APIURL != "" && settings.APIKey != "" && settings.Model != ""
+}
+
 type User struct {
 	ID           int64
+	IsCreator    bool
 	Username     string
 	PasswordHash string
 	Nickname     string
@@ -106,6 +150,21 @@ type AdminComment struct {
 	Comment
 	PostTitle string
 	PostSlug  string
+}
+
+type CommentNotification struct {
+	ID              int64
+	AuthorName      string
+	AuthorEmail     string
+	Content         string
+	Status          string
+	ParentID        int64
+	ParentName      string
+	ParentEmail     string
+	ReplyNotifiedAt int64
+	PostTitle       string
+	PostKind        string
+	PostSlug        string
 }
 
 func (c Comment) CreatedTime() time.Time { return time.Unix(c.CreatedAt, 0) }

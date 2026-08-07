@@ -39,12 +39,81 @@ func (r *Repository) Settings() (SiteSettings, error) {
 		Description: values["site_description"], Keywords: values["site_keywords"],
 		Footer: values["site_footer"], Beian: values["footer_beian"],
 		FaviconURL: values["favicon_url"], PostsPerPage: perPage,
-		Comments: values["comments_enabled"] != "0", RequireApproval: values["comments_require_approval"] != "0",
-		PrettyURL: values["pretty_url"] != "0",
+		Comments: values["comments_enabled"] != "0", NotifyComments: values["comments_notify"] == "1",
+		RequireApproval: values["comments_require_approval"] != "0",
+		PrettyURL:       values["pretty_url"] != "0",
 	}, rows.Err()
 }
 
+func (r *Repository) MailSettings() (MailSettings, error) {
+	values, err := r.namedSettings("mail_settings")
+	if err != nil {
+		return MailSettings{}, err
+	}
+	port, _ := strconv.Atoi(values["smtp_port"])
+	settings := MailSettings{
+		Enabled: values["smtp_enabled"] == "1", Encryption: values["smtp_encryption"],
+		Host: values["smtp_host"], Port: port, Username: values["smtp_username"], Password: values["smtp_password"],
+		FromEmail: values["smtp_from_email"], FromName: values["smtp_from_name"], NotifyEmail: values["smtp_notify_email"],
+	}
+	settings.HasPassword = settings.Password != ""
+	return settings, nil
+}
+
+func (r *Repository) S3Settings() (S3Settings, error) {
+	values, err := r.namedSettings("s3_settings")
+	if err != nil {
+		return S3Settings{}, err
+	}
+	settings := S3Settings{
+		Enabled: values["s3_enabled"] == "1", Endpoint: values["s3_endpoint"], Region: values["s3_region"],
+		Bucket: values["s3_bucket"], AccessKey: values["s3_access_key"], SecretKey: values["s3_secret_key"],
+		PublicURL: values["s3_public_url"], PathPrefix: values["s3_path_prefix"],
+		PathStyle: values["s3_path_style"] == "1", KeepLocal: values["s3_keep_local"] == "1",
+	}
+	settings.HasAccessKey, settings.HasSecretKey = settings.AccessKey != "", settings.SecretKey != ""
+	return settings, nil
+}
+
+func (r *Repository) AISettings() (AISettings, error) {
+	values, err := r.namedSettings("ai_settings")
+	if err != nil {
+		return AISettings{}, err
+	}
+	settings := AISettings{
+		APIURL: values["ai_api_url"], APIKey: values["ai_api_key"], Model: values["ai_model"],
+		SummaryPrompt: values["ai_summary_prompt"], SlugPrompt: values["ai_slug_prompt"],
+		PolishPrompt: values["ai_polish_prompt"],
+	}
+	settings.HasAPIKey = settings.APIKey != ""
+	return settings, nil
+}
+
+func (r *Repository) namedSettings(table string) (map[string]string, error) {
+	if table != "mail_settings" && table != "s3_settings" && table != "ai_settings" {
+		return nil, fmt.Errorf("unsupported settings table %q", table)
+	}
+	rows, err := r.db.Query("SELECT name,value FROM " + table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := map[string]string{}
+	for rows.Next() {
+		var name, value string
+		if err := rows.Scan(&name, &value); err != nil {
+			return nil, err
+		}
+		values[name] = value
+	}
+	return values, rows.Err()
+}
+
 const postColumns = `p.id,COALESCE(p.author_id,0),COALESCE(p.category_id,0),p.slug,p.title,p.excerpt,p.content,
+p.kind,p.tags,p.views,p.status,p.published_at,p.created_at,p.updated_at,p.is_pinned,p.allow_comments,
+COALESCE(NULLIF(u.nickname,''),u.username,''),COALESCE(c.name,''),COALESCE(c.slug,'')`
+
+const postSummaryColumns = `p.id,COALESCE(p.author_id,0),COALESCE(p.category_id,0),p.slug,p.title,p.excerpt,'' AS content,
 p.kind,p.tags,p.views,p.status,p.published_at,p.created_at,p.updated_at,p.is_pinned,p.allow_comments,
 COALESCE(NULLIF(u.nickname,''),u.username,''),COALESCE(c.name,''),COALESCE(c.slug,'')`
 
@@ -75,7 +144,7 @@ ORDER BY p.is_pinned DESC,p.published_at DESC,p.id DESC LIMIT ? OFFSET ?`
 }
 
 func (r *Repository) AllPublished() ([]Post, error) {
-	query := `SELECT ` + postColumns + ` FROM posts p
+	query := `SELECT ` + postSummaryColumns + ` FROM posts p
 LEFT JOIN users u ON u.id=p.author_id LEFT JOIN categories c ON c.id=p.category_id
 WHERE p.kind='post' AND p.status='published' AND p.published_at<=?
 ORDER BY p.published_at DESC,p.id DESC`
@@ -143,7 +212,7 @@ LEFT JOIN users u ON u.id=p.author_id LEFT JOIN categories c ON c.id=p.category_
 }
 
 func (r *Repository) NavPages() ([]Post, error) {
-	query := `SELECT ` + postColumns + ` FROM posts p
+	query := `SELECT ` + postSummaryColumns + ` FROM posts p
 LEFT JOIN users u ON u.id=p.author_id LEFT JOIN categories c ON c.id=p.category_id
 WHERE p.kind='page' AND p.status='published' AND p.published_at<=? ORDER BY p.created_at,p.id`
 	rows, err := r.db.Query(query, time.Now().Unix())
@@ -152,6 +221,24 @@ WHERE p.kind='page' AND p.status='published' AND p.published_at<=? ORDER BY p.cr
 	}
 	defer rows.Close()
 	return r.collectPosts(rows)
+}
+
+func (r *Repository) SitemapContents() ([]Post, error) {
+	rows, err := r.db.Query(`SELECT slug,kind,updated_at FROM posts
+WHERE status='published' AND published_at<=? ORDER BY id`, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	posts := []Post{}
+	for rows.Next() {
+		var post Post
+		if err := rows.Scan(&post.Slug, &post.Kind, &post.UpdatedAt); err != nil {
+			return nil, err
+		}
+		posts = append(posts, post)
+	}
+	return posts, rows.Err()
 }
 
 func (r *Repository) Categories() ([]Category, error) {
@@ -221,6 +308,82 @@ func (r *Repository) HydrateTags(posts []Post) ([]Post, error) {
 	return posts, rows.Err()
 }
 
+func (r *Repository) EnsureTagMetadata() error {
+	rows, err := r.db.Query("SELECT tags FROM posts ORDER BY id")
+	if err != nil {
+		return err
+	}
+	labels := []string{}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var postLabels []string
+		if err := json.Unmarshal([]byte(raw), &postLabels); err != nil {
+			continue
+		}
+		for _, label := range postLabels {
+			label = strings.TrimSpace(label)
+			if label != "" && !seen[label] {
+				seen[label] = true
+				labels = append(labels, label)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return r.ensureTagMetadata(labels)
+}
+
+func (r *Repository) ensureTagMetadata(labels []string) error {
+	now := time.Now().Unix()
+	for _, label := range labels {
+		var existing string
+		err := r.db.QueryRow("SELECT slug FROM tag_meta WHERE label=?", label).Scan(&existing)
+		if err == nil {
+			continue
+		}
+		if !IsNotFound(err) {
+			return err
+		}
+
+		base := slugify(label)
+		if base == "" {
+			base = "tag"
+		}
+		for suffix := 1; ; suffix++ {
+			slug := base
+			if suffix > 1 {
+				slug += "-" + strconv.Itoa(suffix)
+			}
+			var owner string
+			err := r.db.QueryRow("SELECT label FROM tag_meta WHERE slug=?", slug).Scan(&owner)
+			if err == nil {
+				continue
+			}
+			if !IsNotFound(err) {
+				return err
+			}
+			if _, err := r.db.Exec("INSERT INTO tag_meta(label,slug,updated_at) VALUES(?,?,?)", label, slug, now); err == nil {
+				break
+			} else if lookupErr := r.db.QueryRow("SELECT slug FROM tag_meta WHERE label=?", label).Scan(&existing); lookupErr == nil {
+				break
+			} else if !isUniqueConflict(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (r *Repository) Tags() ([]Tag, error) {
 	posts, err := r.AllPublished()
 	if err != nil {
@@ -268,7 +431,7 @@ func (r *Repository) PostsByCategory(slug string) ([]Post, Category, error) {
 	if err != nil {
 		return nil, category, err
 	}
-	query := `SELECT ` + postColumns + ` FROM posts p
+	query := `SELECT ` + postSummaryColumns + ` FROM posts p
 LEFT JOIN users u ON u.id=p.author_id LEFT JOIN categories c ON c.id=p.category_id
 WHERE p.kind='post' AND p.category_id=? AND p.status='published' AND p.published_at<=?
 ORDER BY p.is_pinned DESC,p.published_at DESC,p.id DESC`
@@ -309,32 +472,53 @@ author_name,author_email,author_url,content,status,is_read,created_at FROM comme
 }
 
 func (r *Repository) CreateComment(comment Comment, ipHash, ip, userAgent string, requireApproval bool) error {
+	_, err := r.CreateCommentReturningID(comment, ipHash, ip, userAgent, requireApproval)
+	return err
+}
+
+func (r *Repository) CreateCommentReturningID(comment Comment, ipHash, ip, userAgent string, requireApproval bool) (int64, error) {
 	status := "approved"
 	if requireApproval {
 		status = "pending"
 	}
 	now := time.Now().Unix()
-	_, err := r.db.Exec(`INSERT INTO comments(post_id,user_id,parent_id,reply_to_name,author_name,author_email,
+	query := `INSERT INTO comments(post_id,user_id,parent_id,reply_to_name,author_name,author_email,
 author_url,content,status,is_read,ip_hash,ip_address,user_agent,reply_notified_at,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,0,?,?)`, comment.PostID, nullableID(comment.UserID), nullableID(comment.ParentID),
+VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,0,?,?)`
+	args := []any{comment.PostID, nullableID(comment.UserID), nullableID(comment.ParentID),
 		comment.ReplyToName, comment.AuthorName, comment.AuthorEmail, comment.AuthorURL, comment.Content,
-		status, ipHash, ip, userAgent, now, now)
-	return err
+		status, ipHash, ip, userAgent, now, now}
+	if r.db.Dialect == "postgres" {
+		var id int64
+		err := r.db.QueryRow(query+" RETURNING id", args...).Scan(&id)
+		return id, err
+	}
+	result, err := r.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 func (r *Repository) UserByUsername(username string) (User, error) {
 	var user User
-	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at
+	var creator int
+	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
+CASE WHEN id=(SELECT MIN(id) FROM users) THEN 1 ELSE 0 END
 FROM users WHERE username=?`, username).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Nickname,
-		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt)
+		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt, &creator)
+	user.IsCreator = creator != 0
 	return user, err
 }
 
 func (r *Repository) UserByID(id int64) (User, error) {
 	var user User
-	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at
+	var creator int
+	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
+CASE WHEN id=(SELECT MIN(id) FROM users) THEN 1 ELSE 0 END
 FROM users WHERE id=?`, id).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Nickname,
-		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt)
+		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt, &creator)
+	user.IsCreator = creator != 0
 	return user, err
 }
 
@@ -381,7 +565,7 @@ func (r *Repository) Dashboard() (DashboardStats, error) {
 }
 
 func (r *Repository) AdminPosts() ([]Post, error) {
-	query := `SELECT ` + postColumns + ` FROM posts p
+	query := `SELECT ` + postSummaryColumns + ` FROM posts p
 LEFT JOIN users u ON u.id=p.author_id LEFT JOIN categories c ON c.id=p.category_id
 ORDER BY p.updated_at DESC,p.id DESC`
 	rows, err := r.db.Query(query)
@@ -397,7 +581,11 @@ func (r *Repository) SavePost(post Post) (int64, error) {
 	if post.PublishedAt == 0 && post.Status == "published" {
 		post.PublishedAt = now
 	}
-	tags, _ := json.Marshal(tagLabels(post.Tags))
+	labels := tagLabels(post.Tags)
+	if err := r.ensureTagMetadata(labels); err != nil {
+		return 0, err
+	}
+	tags, _ := json.Marshal(labels)
 	if post.ID == 0 {
 		if r.db.Dialect == "postgres" {
 			var id int64
@@ -451,6 +639,23 @@ FROM comments c INNER JOIN posts p ON p.id=c.post_id ORDER BY c.created_at DESC,
 	return items, rows.Err()
 }
 
+func (r *Repository) CommentNotification(id int64) (CommentNotification, error) {
+	var item CommentNotification
+	err := r.db.QueryRow(`SELECT c.id,c.author_name,c.author_email,c.content,c.status,COALESCE(c.parent_id,0),
+COALESCE(parent.author_name,''),COALESCE(parent.author_email,''),c.reply_notified_at,p.title,p.kind,p.slug
+FROM comments c INNER JOIN posts p ON p.id=c.post_id
+LEFT JOIN comments parent ON parent.id=c.parent_id WHERE c.id=?`, id).Scan(
+		&item.ID, &item.AuthorName, &item.AuthorEmail, &item.Content, &item.Status, &item.ParentID,
+		&item.ParentName, &item.ParentEmail, &item.ReplyNotifiedAt, &item.PostTitle, &item.PostKind, &item.PostSlug,
+	)
+	return item, err
+}
+
+func (r *Repository) MarkReplyNotified(id int64) error {
+	_, err := r.db.Exec("UPDATE comments SET reply_notified_at=? WHERE id=? AND reply_notified_at=0", time.Now().Unix(), id)
+	return err
+}
+
 func (r *Repository) ModerateComment(id int64, action string) error {
 	switch action {
 	case "approve":
@@ -471,7 +676,7 @@ func (r *Repository) SavePublicSettings(values map[string]string) error {
 	allowed := map[string]bool{
 		"site_name": true, "site_tagline": true, "site_description": true, "site_keywords": true,
 		"site_footer": true, "footer_beian": true, "favicon_url": true, "posts_per_page": true,
-		"comments_enabled": true, "comments_require_approval": true, "pretty_url": true,
+		"comments_enabled": true, "comments_notify": true, "comments_require_approval": true, "pretty_url": true,
 	}
 	for name, value := range values {
 		if !allowed[name] {
@@ -489,6 +694,77 @@ func (r *Repository) SavePublicSettings(values map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func (r *Repository) SaveAdminSettings(public map[string]string, mailSettings MailSettings, s3Settings S3Settings, aiSettings AISettings) error {
+	allowed := map[string]bool{
+		"site_name": true, "site_tagline": true, "site_description": true, "site_keywords": true,
+		"site_footer": true, "footer_beian": true, "favicon_url": true, "posts_per_page": true,
+		"comments_enabled": true, "comments_notify": true, "comments_require_approval": true, "pretty_url": true,
+	}
+	mailValues := map[string]string{
+		"smtp_enabled": boolString(mailSettings.Enabled), "smtp_encryption": mailSettings.Encryption,
+		"smtp_host": mailSettings.Host, "smtp_port": strconv.Itoa(mailSettings.Port), "smtp_username": mailSettings.Username,
+		"smtp_password": mailSettings.Password, "smtp_from_email": mailSettings.FromEmail,
+		"smtp_from_name": mailSettings.FromName, "smtp_notify_email": mailSettings.NotifyEmail,
+	}
+	s3Values := map[string]string{
+		"s3_enabled": boolString(s3Settings.Enabled), "s3_endpoint": s3Settings.Endpoint, "s3_region": s3Settings.Region,
+		"s3_bucket": s3Settings.Bucket, "s3_access_key": s3Settings.AccessKey, "s3_secret_key": s3Settings.SecretKey,
+		"s3_public_url": s3Settings.PublicURL, "s3_path_prefix": s3Settings.PathPrefix,
+		"s3_path_style": boolString(s3Settings.PathStyle), "s3_keep_local": boolString(s3Settings.KeepLocal),
+	}
+	aiValues := map[string]string{
+		"ai_api_url": aiSettings.APIURL, "ai_api_key": aiSettings.APIKey, "ai_model": aiSettings.Model,
+		"ai_summary_prompt": aiSettings.SummaryPrompt, "ai_slug_prompt": aiSettings.SlugPrompt,
+		"ai_polish_prompt": aiSettings.PolishPrompt,
+	}
+	tx, err := r.db.DB.Begin()
+	if err != nil {
+		return err
+	}
+	for name, value := range public {
+		if allowed[name] {
+			if err := r.saveNamedSetting(tx, "settings", name, value); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		}
+	}
+	for name, value := range mailValues {
+		if err := r.saveNamedSetting(tx, "mail_settings", name, value); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for name, value := range s3Values {
+		if err := r.saveNamedSetting(tx, "s3_settings", name, value); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for name, value := range aiValues {
+		if err := r.saveNamedSetting(tx, "ai_settings", name, value); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *Repository) saveNamedSetting(tx *sql.Tx, table, name, value string) error {
+	if table != "settings" && table != "mail_settings" && table != "s3_settings" && table != "ai_settings" {
+		return fmt.Errorf("unsupported settings table %q", table)
+	}
+	result, err := tx.Exec(r.db.Bind("UPDATE "+table+" SET value=? WHERE name=?"), value, name)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		_, err = tx.Exec(r.db.Bind("INSERT INTO "+table+"(name,value) VALUES(?,?)"), name, value)
+	}
+	return err
 }
 
 func (r *Repository) SaveCategory(category Category) error {
@@ -583,6 +859,13 @@ func boolInt(value bool) int {
 	return 0
 }
 
+func boolString(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
 func tagLabels(tags []Tag) []string {
 	labels := make([]string, 0, len(tags))
 	for _, tag := range tags {
@@ -614,6 +897,11 @@ func sortTags(items []Tag) {
 }
 
 func IsNotFound(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+func isUniqueConflict(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unique") || strings.Contains(message, "duplicate")
+}
 
 func ParseTags(raw string) []Tag {
 	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '，' || r == '\n' })

@@ -1,14 +1,17 @@
 package blog
 
 import (
+	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/mail"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -85,7 +88,8 @@ func (a *App) home(c echo.Context) error {
 func (a *App) post(c echo.Context) error {
 	rawIdentifier := decodedPathParam(c, "slug")
 	identifier := norm.NFC.String(rawIdentifier)
-	post, err := a.repo.FindContent("post", identifier, currentUser(c) != nil)
+	creator := currentUserIsCreator(c)
+	post, err := a.repo.FindContent("post", identifier, creator)
 	if IsNotFound(err) {
 		return echo.NewHTTPError(http.StatusNotFound, "文章不存在")
 	}
@@ -101,7 +105,7 @@ func (a *App) post(c echo.Context) error {
 	}
 	post.Rendered = string(a.markdown.Render(post.Content))
 	post.CoverURL = PostCover(post.Content)
-	comments, err := a.repo.Comments(post.ID, currentUser(c) == nil)
+	comments, err := a.repo.Comments(post.ID, !creator)
 	if err != nil {
 		return err
 	}
@@ -110,7 +114,7 @@ func (a *App) post(c echo.Context) error {
 	data.CanComment = data.Settings.Comments && post.AllowComments && post.Status == "published" && post.PublishedAt <= time.Now().Unix()
 	data.Description = DeriveExcerpt(post, 160)
 	if post.Status == "published" {
-		_ = a.repo.TrackView(post.ID, a.auth.IPHash(clientIP(c.Request())))
+		_ = a.repo.TrackView(post.ID, a.auth.IPHash(clientIP(c)))
 	}
 	return a.render(c, http.StatusOK, "public", data)
 }
@@ -122,7 +126,8 @@ func (a *App) page(c echo.Context) error {
 	if reserved[slug] {
 		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
 	}
-	post, err := a.repo.FindContent("page", slug, currentUser(c) != nil)
+	creator := currentUserIsCreator(c)
+	post, err := a.repo.FindContent("page", slug, creator)
 	if IsNotFound(err) {
 		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
 	}
@@ -138,7 +143,7 @@ func (a *App) page(c echo.Context) error {
 	}
 	post.Rendered = string(a.markdown.Render(post.Content))
 	data.View, data.Post = "page", post
-	data.Comments, err = a.repo.Comments(post.ID, currentUser(c) == nil)
+	data.Comments, err = a.repo.Comments(post.ID, !creator)
 	if err != nil {
 		return err
 	}
@@ -156,7 +161,6 @@ func (a *App) archives(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	a.decoratePosts(posts)
 	groups := map[int][]Post{}
 	for _, post := range posts {
 		groups[post.PublishedTime().Year()] = append(groups[post.PublishedTime().Year()], post)
@@ -199,7 +203,6 @@ func (a *App) tag(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	a.decoratePosts(posts)
 	data.View, data.Posts, data.Tag = "timeline", posts, Tag{Label: label, Slug: slug, Count: len(posts)}
 	return a.render(c, http.StatusOK, "public", data)
 }
@@ -216,7 +219,6 @@ func (a *App) category(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	a.decoratePosts(posts)
 	data.View, data.Posts, data.Category = "timeline", posts, category
 	return a.render(c, http.StatusOK, "public", data)
 }
@@ -254,6 +256,19 @@ func (a *App) decoratePosts(posts []Post) {
 }
 
 func (a *App) submitComment(c echo.Context) error {
+	c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, 64<<10)
+	if err := c.Request().ParseForm(); err != nil {
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "评论表单不能超过 64KB")
+	}
+	ip := clientIP(c)
+	if allowed, retry := a.commentBurstRate.Allow(ip); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "评论提交过于频繁，请稍后再试")
+	}
+	if allowed, retry := a.commentHourRate.Allow(ip); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "评论提交过于频繁，请稍后再试")
+	}
 	postID := parseID(c.FormValue("post_id"))
 	post, err := a.repo.FindPostByID(postID)
 	if err != nil || !post.AllowComments || a.repo.Setting("comments_enabled") == "0" || post.Status != "published" || post.PublishedAt > time.Now().Unix() {
@@ -284,20 +299,25 @@ func (a *App) submitComment(c echo.Context) error {
 	}
 	if comment.ParentID > 0 {
 		var parentPost int64
-		if err := a.database.QueryRow("SELECT post_id FROM comments WHERE id=?", comment.ParentID).Scan(&parentPost); err != nil || parentPost != postID {
+		if err := a.database.QueryRow("SELECT post_id,author_name FROM comments WHERE id=?", comment.ParentID).Scan(&parentPost, &comment.ReplyToName); err != nil || parentPost != postID {
 			return echo.NewHTTPError(http.StatusBadRequest, "回复目标不存在")
 		}
 	}
-	ip := clientIP(c.Request())
-	if err := a.repo.CreateComment(comment, a.auth.IPHash(ip), ip, c.Request().UserAgent(), a.repo.CommentApprovalRequired()); err != nil {
+	requireApproval := a.repo.CommentApprovalRequired()
+	commentID, err := a.repo.CreateCommentReturningID(comment, a.auth.IPHash(ip), ip, c.Request().UserAgent(), requireApproval)
+	if err != nil {
 		return err
 	}
+	a.queueCommentNotifications(commentID, absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments"), true, !requireApproval)
 	return c.Redirect(http.StatusSeeOther, contentURL(post)+"?comment=submitted#comments")
 }
 
 func (a *App) loginPage(c echo.Context) error {
-	if currentUser(c) != nil {
-		return c.Redirect(http.StatusSeeOther, "/admin")
+	if user := currentUser(c); user != nil {
+		if user.IsCreator {
+			return c.Redirect(http.StatusSeeOther, "/admin")
+		}
+		return c.Redirect(http.StatusSeeOther, "/")
 	}
 	data, err := a.baseData(c, "登录")
 	if err != nil {
@@ -308,7 +328,25 @@ func (a *App) loginPage(c echo.Context) error {
 }
 
 func (a *App) login(c echo.Context) error {
-	user, err := a.repo.UserByUsername(strings.TrimSpace(c.FormValue("username")))
+	c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, 64<<10)
+	if err := c.Request().ParseForm(); err != nil {
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "登录表单不能超过 64KB")
+	}
+	username := strings.TrimSpace(c.FormValue("username"))
+	if len([]rune(username)) < 1 || len([]rune(username)) > 191 {
+		return echo.NewHTTPError(http.StatusUnauthorized, "用户名或密码不正确")
+	}
+	ipKey := clientIP(c)
+	accountKey := strings.ToLower(username)
+	if allowed, retry := a.loginIPRate.Allow(ipKey); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
+	}
+	if allowed, retry := a.loginAccountRate.Allow(accountKey); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
+	}
+	user, err := a.repo.UserByUsername(username)
 	if err != nil || !a.auth.PasswordMatches(user.PasswordHash, c.FormValue("password")) {
 		data, dataErr := a.baseData(c, "登录")
 		if dataErr != nil {
@@ -320,9 +358,18 @@ func (a *App) login(c echo.Context) error {
 	if err := a.auth.SetSession(c.Response(), user.ID); err != nil {
 		return err
 	}
+	a.loginIPRate.Reset(ipKey)
+	a.loginAccountRate.Reset(accountKey)
 	next := c.QueryParam("next")
 	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
-		next = "/admin"
+		if user.IsCreator {
+			next = "/admin"
+		} else {
+			next = "/"
+		}
+	}
+	if !user.IsCreator && strings.HasPrefix(next, "/admin") {
+		next = "/"
 	}
 	return c.Redirect(http.StatusSeeOther, next)
 }
@@ -375,8 +422,17 @@ func (a *App) adminComments(c echo.Context) error {
 }
 
 func (a *App) moderateComment(c echo.Context) error {
-	if err := a.repo.ModerateComment(parseID(c.Param("id")), c.FormValue("action")); err != nil {
+	id := parseID(c.Param("id"))
+	action := c.FormValue("action")
+	if err := a.repo.ModerateComment(id, action); err != nil {
 		return err
+	}
+	if action == "approve" {
+		comment, err := a.repo.CommentNotification(id)
+		if err == nil {
+			post := Post{Kind: comment.PostKind, Slug: comment.PostSlug}
+			a.queueCommentNotifications(id, absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments"), false, true)
+		}
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/comments")
 }
@@ -454,6 +510,18 @@ func (a *App) adminSettings(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	data.Mail, err = a.repo.MailSettings()
+	if err != nil {
+		return err
+	}
+	data.S3, err = a.repo.S3Settings()
+	if err != nil {
+		return err
+	}
+	data.AI, err = a.repo.AISettings()
+	if err != nil {
+		return err
+	}
 	data.View = "settings"
 	return a.render(c, http.StatusOK, "admin", data)
 }
@@ -468,12 +536,71 @@ func (a *App) saveSettings(c echo.Context) error {
 		"site_description": strings.TrimSpace(c.FormValue("site_description")), "site_keywords": strings.TrimSpace(c.FormValue("site_keywords")),
 		"site_footer": strings.TrimSpace(c.FormValue("site_footer")), "footer_beian": strings.TrimSpace(c.FormValue("footer_beian")),
 		"favicon_url": strings.TrimSpace(c.FormValue("favicon_url")), "posts_per_page": strconv.Itoa(perPage),
-		"comments_enabled": checkboxValue(c.FormValue("comments_enabled")), "comments_require_approval": checkboxValue(c.FormValue("comments_require_approval")), "pretty_url": "1",
+		"comments_enabled": checkboxValue(c.FormValue("comments_enabled")), "comments_notify": checkboxValue(c.FormValue("comments_notify")),
+		"comments_require_approval": checkboxValue(c.FormValue("comments_require_approval")), "pretty_url": "1",
 	}
 	if values["site_name"] == "" {
 		return echo.NewHTTPError(http.StatusUnprocessableEntity, "站点名称不能为空")
 	}
-	if err := a.repo.SavePublicSettings(values); err != nil {
+	existingMail, err := a.repo.MailSettings()
+	if err != nil {
+		return err
+	}
+	mailPort, _ := strconv.Atoi(c.FormValue("smtp_port"))
+	mailSettings := MailSettings{
+		Enabled: c.FormValue("smtp_enabled") == "1", Encryption: strings.ToLower(strings.TrimSpace(c.FormValue("smtp_encryption"))),
+		Host: strings.TrimSpace(c.FormValue("smtp_host")), Port: mailPort, Username: strings.TrimSpace(c.FormValue("smtp_username")),
+		Password: c.FormValue("smtp_password"), FromEmail: strings.TrimSpace(c.FormValue("smtp_from_email")),
+		FromName: strings.TrimSpace(c.FormValue("smtp_from_name")), NotifyEmail: strings.TrimSpace(c.FormValue("smtp_notify_email")),
+	}
+	if mailSettings.Password == "" {
+		mailSettings.Password = existingMail.Password
+	}
+	if err := validateMailSettings(mailSettings); err != nil {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+	}
+	existingS3, err := a.repo.S3Settings()
+	if err != nil {
+		return err
+	}
+	prefix, err := normalizeS3Prefix(c.FormValue("s3_path_prefix"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+	}
+	s3Settings := S3Settings{
+		Enabled: c.FormValue("s3_enabled") == "1", Endpoint: strings.TrimRight(strings.TrimSpace(c.FormValue("s3_endpoint")), "/"),
+		Region: strings.TrimSpace(c.FormValue("s3_region")), Bucket: strings.TrimSpace(c.FormValue("s3_bucket")),
+		AccessKey: strings.TrimSpace(c.FormValue("s3_access_key")), SecretKey: c.FormValue("s3_secret_key"),
+		PublicURL: strings.TrimRight(strings.TrimSpace(c.FormValue("s3_public_url")), "/"), PathPrefix: prefix,
+		PathStyle: c.FormValue("s3_path_style") == "1", KeepLocal: c.FormValue("s3_keep_local") == "1",
+	}
+	if s3Settings.AccessKey == "" {
+		s3Settings.AccessKey = existingS3.AccessKey
+	}
+	if s3Settings.SecretKey == "" {
+		s3Settings.SecretKey = existingS3.SecretKey
+	}
+	if err := validateS3Settings(s3Settings); err != nil {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+	}
+	existingAI, err := a.repo.AISettings()
+	if err != nil {
+		return err
+	}
+	aiSettings := AISettings{
+		APIURL: strings.TrimRight(strings.TrimSpace(c.FormValue("ai_api_url")), "/"),
+		APIKey: c.FormValue("ai_api_key"), Model: strings.TrimSpace(c.FormValue("ai_model")),
+		SummaryPrompt: strings.TrimSpace(c.FormValue("ai_summary_prompt")),
+		SlugPrompt:    strings.TrimSpace(c.FormValue("ai_slug_prompt")),
+		PolishPrompt:  strings.TrimSpace(c.FormValue("ai_polish_prompt")),
+	}
+	if aiSettings.APIKey == "" {
+		aiSettings.APIKey = existingAI.APIKey
+	}
+	if err := validateAISettings(aiSettings); err != nil {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+	}
+	if err := a.repo.SaveAdminSettings(values, mailSettings, s3Settings, aiSettings); err != nil {
 		return err
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/settings?saved=1")
@@ -495,12 +622,18 @@ func (a *App) uploadAttachment(c echo.Context) error {
 	}
 	defer file.Close()
 
-	buffer := make([]byte, 512)
-	n, err := io.ReadFull(file, buffer)
-	if err != nil && err != io.ErrUnexpectedEOF {
+	data, err := io.ReadAll(io.LimitReader(file, (10<<20)+1))
+	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "无法读取文件")
 	}
-	mime := http.DetectContentType(buffer[:n])
+	if len(data) > 10<<20 {
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "文件不能超过 10MB")
+	}
+	sample := data
+	if len(sample) > 512 {
+		sample = sample[:512]
+	}
+	mime := http.DetectContentType(sample)
 	extensions := map[string]string{
 		"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
 		"application/pdf": ".pdf", "text/plain; charset=utf-8": ".txt",
@@ -509,37 +642,140 @@ func (a *App) uploadAttachment(c echo.Context) error {
 	if !ok {
 		return echo.NewHTTPError(http.StatusUnsupportedMediaType, "仅支持 JPG、PNG、GIF、WebP、PDF 和纯文本")
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
 	token, err := randomToken(12)
 	if err != nil {
 		return err
 	}
 	year := strconv.Itoa(time.Now().Year())
-	directory := filepath.Join(a.cfg.UploadDir, year)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return err
-	}
 	name := token + ext
-	path := filepath.Join(directory, name)
-	target, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	s3Settings, err := a.repo.S3Settings()
 	if err != nil {
 		return err
 	}
-	written, copyErr := io.Copy(target, io.LimitReader(file, (10<<20)+1))
-	closeErr := target.Close()
-	if copyErr != nil || closeErr != nil || written > 10<<20 {
-		_ = os.Remove(path)
-		if copyErr != nil {
-			return copyErr
+	if s3Settings.Enabled {
+		if err := validateS3Settings(s3Settings); err != nil {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, "S3 配置无效："+err.Error())
 		}
-		if written > 10<<20 {
-			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "文件不能超过 10MB")
+		if s3Settings.KeepLocal {
+			if err := writeLocalUpload(a.cfg.UploadDir, year, name, data); err != nil {
+				return err
+			}
 		}
-		return closeErr
+		key := path.Join(s3Settings.PathPrefix, year, name)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 30*time.Second)
+		defer cancel()
+		if err := a.putObject(ctx, s3Settings, key, mime, bytes.NewReader(data), int64(len(data))); err != nil {
+			return echo.NewHTTPError(http.StatusBadGateway, "上传到 S3 失败").SetInternal(err)
+		}
+		return c.JSON(http.StatusCreated, map[string]string{"url": s3Settings.objectURL(key), "name": header.Filename})
+	}
+	if err := writeLocalUpload(a.cfg.UploadDir, year, name, data); err != nil {
+		return err
 	}
 	return c.JSON(http.StatusCreated, map[string]string{"url": "/uploads/" + year + "/" + name, "name": header.Filename})
+}
+
+func writeLocalUpload(root, year, name string, data []byte) error {
+	directory := filepath.Join(root, year)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(directory, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func (a *App) aiAction(c echo.Context) error {
+	c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, 2<<20)
+	if err := c.Request().ParseMultipartForm(2 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+		var maxBytesError *http.MaxBytesError
+		if !errors.As(err, &maxBytesError) {
+			return echo.NewHTTPError(http.StatusBadRequest, "AI 请求表单格式无效")
+		}
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "AI 请求不能超过 2MB")
+	}
+	user := currentUser(c)
+	if user == nil {
+		return echo.NewHTTPError(http.StatusUnauthorized)
+	}
+	if allowed, retry := a.aiRate.Allow(strconv.FormatInt(user.ID, 10)); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "AI 操作过于频繁，请稍后再试")
+	}
+	settings, err := a.repo.AISettings()
+	if err != nil {
+		return err
+	}
+	if !settings.Ready() {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "请先在设置中配置 AI")
+	}
+	if err := validateAISettings(settings); err != nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
+	}
+	action := c.FormValue("action")
+	title := strings.TrimSpace(c.FormValue("title"))
+	content := strings.TrimSpace(c.FormValue("content"))
+	if len([]rune(title)) > 200 || len([]rune(content)) > 300000 {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "AI 输入内容过长")
+	}
+
+	var systemPrompt, userPrompt string
+	maxTokens := 1000
+	switch action {
+	case "summary":
+		if content == "" {
+			return echo.NewHTTPError(http.StatusUnprocessableEntity, "请先填写正文")
+		}
+		systemPrompt = settings.SummaryPrompt
+		userPrompt = "文章标题：" + title + "\n\n文章正文：\n" + content
+		maxTokens = 500
+	case "slug":
+		if title == "" {
+			return echo.NewHTTPError(http.StatusUnprocessableEntity, "请先填写标题")
+		}
+		systemPrompt, userPrompt, maxTokens = settings.SlugPrompt, title, 100
+	case "polish":
+		if content == "" {
+			return echo.NewHTTPError(http.StatusUnprocessableEntity, "请先填写正文或选择需要润色的内容")
+		}
+		instruction := strings.TrimSpace(c.FormValue("instruction"))
+		if len([]rune(instruction)) > 500 {
+			return echo.NewHTTPError(http.StatusUnprocessableEntity, "润色要求不能超过 500 个字符")
+		}
+		systemPrompt = settings.PolishPrompt
+		if instruction != "" {
+			systemPrompt += "\n\n本次润色要求：" + instruction
+		}
+		userPrompt, maxTokens = content, 8192
+	default:
+		return echo.NewHTTPError(http.StatusBadRequest, "无效的 AI 操作")
+	}
+
+	result, err := a.completeAI(c.Request().Context(), a.aiClient, settings, systemPrompt, userPrompt, maxTokens)
+	if err != nil {
+		a.logger.Warn("AI request failed", "action", action, "error", err)
+		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
+	}
+	switch action {
+	case "summary":
+		result = truncateRunes(strings.Trim(strings.TrimSpace(result), "\"'"), 500)
+	case "slug":
+		result = normalizeAISlug(result)
+		if result == "" {
+			return echo.NewHTTPError(http.StatusBadGateway, "AI 未返回有效的 Slug")
+		}
+	case "polish":
+		if len([]rune(result)) > 300000 {
+			return echo.NewHTTPError(http.StatusBadGateway, "AI 返回的润色正文过长")
+		}
+	}
+	return c.JSON(http.StatusOK, map[string]string{"result": result})
 }
 
 func (a *App) editor(c echo.Context) error {
@@ -551,6 +787,11 @@ func (a *App) editor(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+	aiSettings, err := a.repo.AISettings()
+	if err != nil {
+		return err
+	}
+	data.AIReady = aiSettings.Ready()
 	if id := parseID(c.Param("id")); id > 0 {
 		data.Post, err = a.repo.FindPostByID(id)
 		if IsNotFound(err) {
@@ -596,7 +837,7 @@ func (a *App) saveEditor(c echo.Context) error {
 	}
 	postID, err := a.repo.SavePost(post)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		if isUniqueConflict(err) {
 			return echo.NewHTTPError(http.StatusConflict, "Slug 已被其他内容使用")
 		}
 		return err
@@ -632,11 +873,7 @@ func (a *App) rss(c echo.Context) error {
 }
 
 func (a *App) sitemap(c echo.Context) error {
-	posts, err := a.repo.AllPublished()
-	if err != nil {
-		return err
-	}
-	pages, err := a.repo.NavPages()
+	contents, err := a.repo.SitemapContents()
 	if err != nil {
 		return err
 	}
@@ -644,7 +881,7 @@ func (a *App) sitemap(c echo.Context) error {
 	for _, path := range []string{"/", "/archives", "/tags", "/links"} {
 		set.URLs = append(set.URLs, sitemapURL{Loc: absoluteURL(c, path)})
 	}
-	for _, post := range append(posts, pages...) {
+	for _, post := range contents {
 		set.URLs = append(set.URLs, sitemapURL{Loc: absoluteURL(c, contentURL(post)), LastMod: time.Unix(post.UpdatedAt, 0).Format("2006-01-02")})
 	}
 	output, err := xml.MarshalIndent(set, "", "  ")
@@ -697,13 +934,7 @@ func absoluteURL(c echo.Context, path string) string {
 	return scheme + "://" + c.Request().Host + path
 }
 
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
+func clientIP(c echo.Context) string { return c.RealIP() }
 
 func countComments(comments []Comment) int {
 	total := 0

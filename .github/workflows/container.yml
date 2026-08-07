@@ -20,8 +20,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify:
+    name: Test and vet
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Run tests
+        run: go test ./... -count=1
+
+      - name: Run vet
+        run: go vet ./...
+
   publish:
     name: Build and publish
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository

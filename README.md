@@ -7,12 +7,13 @@
 - 使用现有 SQLite 表结构，无需导入导出
 - 首页、文章、独立页面、归档、标签、分类和友链
 - Goldmark Markdown 渲染与 HTML 白名单清理
-- 评论、嵌套回复、审核和浏览计数
+- 评论、嵌套回复、审核、SMTP 邮件通知和浏览计数
 - RSS 2.0 和 Sitemap
 - bcrypt 密码验证
 - 签名登录会话、CSRF 校验和安全响应头
 - 文章、页面、评论、分类、友链和站点设置管理
-- 本地附件上传并自动插入 Markdown
+- 本地或 S3 兼容对象存储附件上传，并自动插入 Markdown
+- OpenAI 兼容接口自动生成摘要、翻译 Slug 和按需润色文章
 - SQLite、PostgreSQL 和 MySQL/MariaDB 数据库驱动
 - 模板、CSS 和 JavaScript 通过 `go:embed` 嵌入程序
 
@@ -128,12 +129,17 @@ BLOG_SCHEMA_MODE=init \
 | `BLOG_SCHEMA_MODE` | `validate` | `validate` 或 `init` |
 | `BLOG_UPLOAD_DIR` | `uploads` | 上传文件目录 |
 | `BLOG_SESSION_SECRET` | 空 | 至少 32 字节；生产环境必须设置 |
+| `BLOG_TRUSTED_PROXY` | 空 | 可信反向代理 IP/CIDR，多个值用逗号分隔 |
 | `BLOG_SECURE_COOKIES` | `false` | HTTPS 部署时设置为 `true` |
 | `BLOG_LOG_LEVEL` | `info` | `debug`、`info`、`warn`、`error` |
 
 同名命令行参数包括 `--listen`、`--database-driver`、`--database`、`--schema-mode` 和 `--uploads`。
 
-反向代理需要转发 `Host`，并将 `/` 代理到程序监听地址。生产环境建议只通过 HTTPS 暴露服务，并设置 `BLOG_SECURE_COOKIES=true`。
+反向代理需要转发 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，并将 `/` 代理到程序监听地址。将代理服务器的地址或网段写入 `BLOG_TRUSTED_PROXY`，例如 `127.0.0.1,172.18.0.0/16`；不要填写不受控制的公网网段。生产环境建议只通过 HTTPS 暴露服务，并设置 `BLOG_SECURE_COOKIES=true`。
+
+`users` 表中 ID 最小的第一个用户是站点创建者，可访问完整管理后台；其余用户属于订阅者，只能阅读和评论。登录与评论接口带有进程内频率限制，多实例部署时应在反向代理层再配置共享限流。
+
+评论邮件通知、S3 兼容上传和 AI 辅助在后台“设置”页面配置。SMTP 支持无加密、STARTTLS 和隐式 TLS/SSL；S3 支持自定义 Endpoint、Path-style、公开 URL、路径前缀和本地副本保留。AI 辅助支持 OpenAI 兼容的 Chat Completions 接口，可配置模型以及摘要、Slug、润色提示词。已保存的 SMTP 密码、Access Key、Secret Key 和 AI API Key 不会回显到管理页面，密钥输入框留空会保留原值。
 
 ## 数据目录
 

@@ -173,7 +173,7 @@ func (d *Database) EnsureInitialData(logger *slog.Logger) error {
 	defaults := map[string]string{
 		"site_name": "Go Blog", "site_tagline": "记录技术与生活",
 		"site_description": "一个使用 Go 构建的轻量博客", "site_footer": "© {year} Go Blog",
-		"posts_per_page": "6", "comments_enabled": "1", "comments_require_approval": "1",
+		"posts_per_page": "6", "comments_enabled": "1", "comments_notify": "0", "comments_require_approval": "1",
 		"pretty_url": "1", "active_theme": "nebula",
 	}
 	for name, value := range defaults {
@@ -183,6 +183,22 @@ func (d *Database) EnsureInitialData(logger *slog.Logger) error {
 		}
 		if count == 0 {
 			if _, err := d.Exec("INSERT INTO settings(name,value) VALUES(?,?)", name, value); err != nil {
+				return err
+			}
+		}
+	}
+	aiDefaults := map[string]string{
+		"ai_api_url": "", "ai_api_key": "", "ai_model": "",
+		"ai_summary_prompt": defaultAISummaryPrompt, "ai_slug_prompt": defaultAISlugPrompt,
+		"ai_polish_prompt": defaultAIPolishPrompt,
+	}
+	for name, value := range aiDefaults {
+		var count int
+		if err := d.QueryRow("SELECT COUNT(*) FROM ai_settings WHERE name = ?", name).Scan(&count); err != nil {
+			return err
+		}
+		if count == 0 {
+			if _, err := d.Exec("INSERT INTO ai_settings(name,value) VALUES(?,?)", name, value); err != nil {
 				return err
 			}
 		}

@@ -1,13 +1,18 @@
 package blog
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,15 +22,24 @@ import (
 )
 
 type App struct {
-	cfg       Config
-	logger    *slog.Logger
-	version   string
-	database  *Database
-	repo      *Repository
-	auth      *Auth
-	markdown  *Markdown
-	templates *template.Template
-	echo      *echo.Echo
+	cfg              Config
+	logger           *slog.Logger
+	version          string
+	database         *Database
+	repo             *Repository
+	auth             *Auth
+	markdown         *Markdown
+	templates        *template.Template
+	echo             *echo.Echo
+	loginIPRate      *rateLimiter
+	loginAccountRate *rateLimiter
+	commentBurstRate *rateLimiter
+	commentHourRate  *rateLimiter
+	aiRate           *rateLimiter
+	sendMail         mailSender
+	putObject        objectUploader
+	completeAI       aiCompleter
+	aiClient         *http.Client
 }
 
 type PageData struct {
@@ -46,6 +60,10 @@ type PageData struct {
 	Tags          []Tag
 	Links         []Link
 	Stats         DashboardStats
+	Mail          MailSettings
+	S3            S3Settings
+	AI            AISettings
+	AIReady       bool
 	Page          int
 	TotalPages    int
 	Total         int
@@ -89,11 +107,24 @@ func New(cfg Config, logger *slog.Logger, version string) (*App, error) {
 		database.DB.Close()
 		return nil, err
 	}
-	app := &App{
-		cfg: cfg, logger: logger, version: version, database: database, repo: NewRepository(database),
-		auth: auth, markdown: NewMarkdown(), templates: templates,
+	repo := NewRepository(database)
+	if err := repo.EnsureTagMetadata(); err != nil {
+		database.DB.Close()
+		return nil, fmt.Errorf("initialize tag metadata: %w", err)
 	}
-	app.echo = app.routes()
+	app := &App{
+		cfg: cfg, logger: logger, version: version, database: database, repo: repo,
+		auth: auth, markdown: NewMarkdown(), templates: templates,
+		loginIPRate: newRateLimiter(8, 5*time.Minute), loginAccountRate: newRateLimiter(20, 15*time.Minute),
+		commentBurstRate: newRateLimiter(5, time.Minute), commentHourRate: newRateLimiter(30, time.Hour),
+		aiRate: newRateLimiter(20, time.Minute), sendMail: sendSMTPMail, putObject: uploadS3Object,
+		completeAI: requestAICompletion, aiClient: &http.Client{Timeout: 75 * time.Second},
+	}
+	app.echo, err = app.routes()
+	if err != nil {
+		database.DB.Close()
+		return nil, err
+	}
 	return app, nil
 }
 
@@ -152,11 +183,14 @@ func parseTemplates() (*template.Template, error) {
 
 func strconvItoa(value int) string { return fmt.Sprintf("%d", value) }
 
-func (a *App) routes() *echo.Echo {
+func (a *App) routes() (*echo.Echo, error) {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
 	e.HTTPErrorHandler = a.httpError
+	if err := configureIPExtractor(e, a.cfg.TrustedProxy); err != nil {
+		return nil, err
+	}
 	e.Pre(middleware.RemoveTrailingSlash())
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
@@ -171,11 +205,20 @@ func (a *App) routes() *echo.Echo {
 	e.GET("/static/*", echo.WrapHandler(http.StripPrefix("/static/", http.FileServer(http.FS(staticFS)))))
 	uploadServer := http.StripPrefix("/uploads/", http.FileServer(http.Dir(a.cfg.UploadDir)))
 	e.GET("/uploads/*", func(c echo.Context) error {
-		if strings.HasSuffix(c.Request().URL.Path, "/") {
+		relative := strings.TrimPrefix(path.Clean("/"+c.Param("*")), "/")
+		if relative == "" || strings.HasSuffix(c.Request().URL.Path, "/") {
 			return echo.NewHTTPError(http.StatusNotFound)
 		}
-		uploadServer.ServeHTTP(c.Response(), c.Request())
-		return nil
+		localPath := filepath.Join(a.cfg.UploadDir, filepath.FromSlash(relative))
+		if info, err := os.Stat(localPath); err == nil && !info.IsDir() {
+			uploadServer.ServeHTTP(c.Response(), c.Request())
+			return nil
+		}
+		s3Settings, err := a.repo.S3Settings()
+		if err == nil && s3Settings.Enabled && s3Settings.PublicURL != "" {
+			return c.Redirect(http.StatusTemporaryRedirect, s3Settings.objectURL(path.Join(s3Settings.PathPrefix, relative)))
+		}
+		return echo.NewHTTPError(http.StatusNotFound)
 	})
 	e.GET("/healthz", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok", "version": a.version})
@@ -210,6 +253,7 @@ func (a *App) routes() *echo.Echo {
 	admin.GET("/settings", a.adminSettings)
 	admin.POST("/settings", a.saveSettings)
 	admin.POST("/upload", a.uploadAttachment)
+	admin.POST("/ai", a.aiAction)
 	admin.GET("/write", a.editor)
 	admin.POST("/write", a.saveEditor)
 	admin.GET("/edit/:id", a.editor)
@@ -217,15 +261,64 @@ func (a *App) routes() *echo.Echo {
 	admin.POST("/delete/:id", a.deletePost)
 
 	e.GET("/:slug", a.page)
-	return e
+	return e, nil
+}
+
+func configureIPExtractor(e *echo.Echo, trustedProxy string) error {
+	trustedProxy = strings.TrimSpace(trustedProxy)
+	if trustedProxy == "" {
+		e.IPExtractor = echo.ExtractIPDirect()
+		return nil
+	}
+
+	options := []echo.TrustOption{
+		echo.TrustLoopback(false),
+		echo.TrustLinkLocal(false),
+		echo.TrustPrivateNet(false),
+	}
+	for _, value := range strings.Split(trustedProxy, ",") {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			ip := net.ParseIP(value)
+			if ip == nil {
+				return fmt.Errorf("invalid BLOG_TRUSTED_PROXY address %q", value)
+			}
+			bits := 128
+			if ipv4 := ip.To4(); ipv4 != nil {
+				ip, bits = ipv4, 32
+			}
+			network = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		}
+		options = append(options, echo.TrustIPRange(network))
+	}
+	if len(options) == 3 {
+		return errors.New("BLOG_TRUSTED_PROXY must contain at least one IP address or CIDR")
+	}
+	e.IPExtractor = echo.ExtractIPFromXFFHeader(options...)
+	return nil
 }
 
 func (a *App) logMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		start := time.Now()
 		err := next(c)
+		status := c.Response().Status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if err != nil {
+			status = http.StatusInternalServerError
+			var httpErr *echo.HTTPError
+			if errors.As(err, &httpErr) {
+				status = httpErr.Code
+			}
+		}
 		a.logger.Info("http request", "method", c.Request().Method, "path", c.Request().URL.Path,
-			"status", c.Response().Status, "duration", time.Since(start), "request_id", c.Response().Header().Get(echo.HeaderXRequestID))
+			"status", status, "duration", time.Since(start), "request_id", c.Response().Header().Get(echo.HeaderXRequestID))
 		return err
 	}
 }
@@ -245,10 +338,36 @@ func (a *App) sessionMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 
 func (a *App) requireAdmin(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		if currentUser(c) == nil {
+		user := currentUser(c)
+		if user == nil {
 			return c.Redirect(http.StatusSeeOther, "/login?next="+c.Request().URL.Path)
 		}
+		if !user.IsCreator {
+			return echo.NewHTTPError(http.StatusForbidden, "只有站点创建者可以访问管理后台")
+		}
 		if c.Request().Method != http.MethodGet && c.Request().Method != http.MethodHead {
+			limit := int64(2 << 20)
+			if c.Request().URL.Path == "/admin/upload" {
+				limit = 12 << 20
+			}
+			request := c.Request()
+			request.Body = http.MaxBytesReader(c.Response(), request.Body, limit)
+			mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+			if err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "管理请求表单格式无效")
+			}
+			if mediaType == "multipart/form-data" {
+				err = request.ParseMultipartForm(limit)
+			} else {
+				err = request.ParseForm()
+			}
+			if err != nil {
+				var maxBytesError *http.MaxBytesError
+				if errors.As(err, &maxBytesError) {
+					return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "管理请求内容过大")
+				}
+				return echo.NewHTTPError(http.StatusBadRequest, "管理请求表单格式无效")
+			}
 			claims, ok := c.Get("claims").(sessionClaims)
 			if !ok || !a.auth.ValidCSRF(claims, c.FormValue("csrf")) {
 				return echo.NewHTTPError(http.StatusForbidden, "请求校验失败，请刷新页面后重试")
@@ -261,6 +380,11 @@ func (a *App) requireAdmin(next echo.HandlerFunc) echo.HandlerFunc {
 func currentUser(c echo.Context) *User {
 	user, _ := c.Get("user").(*User)
 	return user
+}
+
+func currentUserIsCreator(c echo.Context) bool {
+	user := currentUser(c)
+	return user != nil && user.IsCreator
 }
 
 func (a *App) httpError(err error, c echo.Context) {
