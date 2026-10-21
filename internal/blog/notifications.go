@@ -16,15 +16,7 @@ import (
 
 type mailSender func(context.Context, MailSettings, string, string, string) error
 
-func (a *App) queueCommentNotifications(commentID int64, publicURL, adminURL string, notifyAdmin, notifyReply bool) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if err := a.sendCommentNotifications(ctx, commentID, publicURL, adminURL, notifyAdmin, notifyReply); err != nil {
-			a.logger.Warn("send comment notification failed", "comment_id", commentID, "error", err)
-		}
-	}()
-}
+var errNotificationsPaused = errors.New("notifications are paused")
 
 func (a *App) sendCommentNotifications(ctx context.Context, commentID int64, publicURL, adminURL string, notifyAdmin, notifyReply bool) error {
 	settings, err := a.repo.Settings()
@@ -32,14 +24,14 @@ func (a *App) sendCommentNotifications(ctx context.Context, commentID int64, pub
 		return err
 	}
 	if !settings.NotifyComments {
-		return nil
+		return errNotificationsPaused
 	}
 	mailSettings, err := a.repo.MailSettings()
 	if err != nil {
 		return err
 	}
 	if !mailSettings.Enabled {
-		return nil
+		return errNotificationsPaused
 	}
 	if mailSettings.FromName == "" {
 		mailSettings.FromName = settings.Name
@@ -58,14 +50,23 @@ func (a *App) sendCommentNotifications(ctx context.Context, commentID int64, pub
 			sendErrors = append(sendErrors, fmt.Errorf("notify administrator: %w", err))
 		}
 	}
-	if notifyReply && comment.Status == "approved" && comment.ParentID > 0 && comment.ReplyNotifiedAt == 0 &&
+	if notifyReply && comment.Status == "approved" && comment.ParentID > 0 && comment.ReplyNotifiedAt <= 0 &&
 		comment.ParentEmail != "" && !strings.EqualFold(comment.ParentEmail, comment.AuthorEmail) {
+		claim, claimed, err := a.repo.ClaimReplyNotification(comment.ID)
+		if err != nil {
+			sendErrors = append(sendErrors, fmt.Errorf("claim reply notification: %w", err))
+			return errors.Join(sendErrors...)
+		}
+		if !claimed {
+			return errors.Join(sendErrors...)
+		}
 		subject := fmt.Sprintf("[%s] %s 回复了你的评论", settings.Name, comment.AuthorName)
 		body := fmt.Sprintf("%s，你好：\n\n%s 在《%s》中回复了你：\n\n%s\n\n查看回复：%s#comment-%d\n",
 			comment.ParentName, comment.AuthorName, comment.PostTitle, notificationExcerpt(comment.Content), publicURL, comment.ID)
 		if err := a.sendMail(ctx, mailSettings, comment.ParentEmail, subject, body); err != nil {
+			_ = a.repo.ReleaseReplyNotification(comment.ID, claim)
 			sendErrors = append(sendErrors, fmt.Errorf("notify parent commenter: %w", err))
-		} else if err := a.repo.MarkReplyNotified(comment.ID); err != nil {
+		} else if err := a.repo.MarkReplyNotified(comment.ID, claim); err != nil {
 			sendErrors = append(sendErrors, fmt.Errorf("mark reply notified: %w", err))
 		}
 	}

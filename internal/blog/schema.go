@@ -1,6 +1,7 @@
 package blog
 
 const sqliteSchema = `
+CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
 CREATE TABLE settings(name TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
 CREATE TABLE ai_settings(name TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
 CREATE TABLE mail_settings(name TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
@@ -69,10 +70,13 @@ CREATE INDEX idx_comments_parent ON comments(parent_id, created_at, id);
 `
 
 var requiredTables = []string{
-	"settings", "users", "posts", "categories", "links", "tag_meta", "comments", "post_views",
+	"site_identity", "notification_jobs",
+	"schema_migrations", "settings", "ai_settings", "mail_settings", "s3_settings", "users", "password_resets",
+	"posts", "categories", "links", "tag_meta", "comments", "post_views",
 }
 
 const postgresSchema = `
+CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS ai_settings(name TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS mail_settings(name TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');
@@ -91,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_post_public ON comments(post_id,status,c
 `
 
 const mysqlSchema = `
+CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY,applied_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(name VARCHAR(191) PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ai_settings(name VARCHAR(191) PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mail_settings(name VARCHAR(191) PRIMARY KEY,value TEXT NOT NULL);

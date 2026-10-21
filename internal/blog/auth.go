@@ -16,11 +16,13 @@ import (
 )
 
 const authCookieName = "go_blog_session"
+const registrationCookieName = "go_blog_registration"
 
 type sessionClaims struct {
-	UserID int64  `json:"uid"`
-	Expiry int64  `json:"exp"`
-	Nonce  string `json:"nonce"`
+	UserID     int64  `json:"uid"`
+	Expiry     int64  `json:"exp"`
+	Nonce      string `json:"nonce"`
+	Credential string `json:"credential"`
 }
 
 type Auth struct {
@@ -45,12 +47,13 @@ func (a *Auth) PasswordMatches(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-func (a *Auth) SetSession(w http.ResponseWriter, userID int64) error {
+func (a *Auth) SetSession(w http.ResponseWriter, userID int64, passwordHash string) error {
 	nonce, err := randomToken(18)
 	if err != nil {
 		return err
 	}
 	claims := sessionClaims{UserID: userID, Expiry: time.Now().Add(12 * time.Hour).Unix(), Nonce: nonce}
+	claims.Credential = a.credential(userID, passwordHash)
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return err
@@ -63,10 +66,55 @@ func (a *Auth) SetSession(w http.ResponseWriter, userID int64) error {
 	return nil
 }
 
+func (a *Auth) credential(userID int64, passwordHash string) string {
+	return base64.RawURLEncoding.EncodeToString(a.sign([]byte("credential:" + strconv.FormatInt(userID, 10) + ":" + passwordHash)))
+}
+
+func (a *Auth) ValidSessionUser(claims sessionClaims, user User) bool {
+	return claims.UserID == user.ID && subtle.ConstantTimeCompare([]byte(claims.Credential), []byte(a.credential(user.ID, user.PasswordHash))) == 1
+}
+
+func validatePassword(password string) error {
+	if len([]rune(password)) < 10 {
+		return errors.New("密码至少需要 10 个字符")
+	}
+	if len(password) > 72 {
+		return errors.New("密码不能超过 72 字节（英文字母通常占 1 字节，汉字通常占 3 字节）")
+	}
+	return nil
+}
+
 func (a *Auth) ClearSession(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name: authCookieName, Value: "", Path: "/", MaxAge: -1,
 		Expires: time.Unix(1, 0), HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (a *Auth) SetRegistrationToken(w http.ResponseWriter) (string, error) {
+	token, err := randomToken(24)
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: registrationCookieName, Value: token, Path: "/register", MaxAge: 15 * 60,
+		Expires: time.Now().Add(15 * time.Minute), HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteStrictMode,
+	})
+	return token, nil
+}
+
+func (a *Auth) ValidRegistrationToken(r *http.Request, value string) bool {
+	cookie, err := r.Cookie(registrationCookieName)
+	if err != nil || value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(value)) == 1
+}
+
+func (a *Auth) ClearRegistrationToken(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: registrationCookieName, Value: "", Path: "/register", MaxAge: -1,
+		Expires: time.Unix(1, 0), HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteStrictMode,
 	})
 }
 

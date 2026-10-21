@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -122,7 +123,7 @@ func (a *App) post(c echo.Context) error {
 func (a *App) page(c echo.Context) error {
 	rawSlug := decodedPathParam(c, "slug")
 	slug := norm.NFC.String(rawSlug)
-	reserved := map[string]bool{"static": true, "healthz": true, "admin": true, "login": true, "logout": true}
+	reserved := map[string]bool{"static": true, "healthz": true, "admin": true, "login": true, "logout": true, "register": true, "account": true}
 	if reserved[slug] {
 		return echo.NewHTTPError(http.StatusNotFound, "页面不存在")
 	}
@@ -304,11 +305,12 @@ func (a *App) submitComment(c echo.Context) error {
 		}
 	}
 	requireApproval := a.repo.CommentApprovalRequired()
-	commentID, err := a.repo.CreateCommentReturningID(comment, a.auth.IPHash(ip), ip, c.Request().UserAgent(), requireApproval)
+	_, err = a.repo.CreateCommentReturningID(comment, a.auth.IPHash(ip), ip, c.Request().UserAgent(), requireApproval,
+		absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments"))
 	if err != nil {
 		return err
 	}
-	a.queueCommentNotifications(commentID, absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments"), true, !requireApproval)
+	a.wakeNotifications()
 	return c.Redirect(http.StatusSeeOther, contentURL(post)+"?comment=submitted#comments")
 }
 
@@ -325,6 +327,185 @@ func (a *App) loginPage(c echo.Context) error {
 	}
 	data.View = "login"
 	return a.render(c, http.StatusOK, "auth", data)
+}
+
+func (a *App) registerPage(c echo.Context) error {
+	if currentUser(c) != nil {
+		return c.Redirect(http.StatusSeeOther, "/account")
+	}
+	token, err := a.auth.SetRegistrationToken(c.Response())
+	if err != nil {
+		return err
+	}
+	return a.renderRegistration(c, http.StatusOK, Registration{}, "", token)
+}
+
+func (a *App) register(c echo.Context) error {
+	c.Request().Body = http.MaxBytesReader(c.Response(), c.Request().Body, 64<<10)
+	if err := c.Request().ParseForm(); err != nil {
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "注册表单不能超过 64KB")
+	}
+	if !a.auth.ValidRegistrationToken(c.Request(), c.FormValue("csrf")) {
+		return echo.NewHTTPError(http.StatusForbidden, "注册页面已过期，请刷新后重试")
+	}
+	ip := clientIP(c)
+	if allowed, retry := a.registerIPRate.Allow(ip); !allowed {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()))))
+		return echo.NewHTTPError(http.StatusTooManyRequests, "注册尝试过于频繁，请稍后再试")
+	}
+	form := Registration{
+		Username: strings.ToLower(strings.TrimSpace(c.FormValue("username"))),
+		Nickname: strings.TrimSpace(c.FormValue("nickname")),
+		Email:    strings.TrimSpace(c.FormValue("email")),
+	}
+	password := c.FormValue("password")
+	if err := validateRegistration(form, password, c.FormValue("password_confirm")); err != nil {
+		return a.renderRegistration(c, http.StatusUnprocessableEntity, form, err.Error(), c.FormValue("csrf"))
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	user, err := a.repo.CreateUser(form.Username, string(hash), form.Nickname, form.Email)
+	if err != nil {
+		if isUniqueConflict(err) {
+			return a.renderRegistration(c, http.StatusConflict, form, "用户名已被使用", c.FormValue("csrf"))
+		}
+		return err
+	}
+	if err := a.auth.SetSession(c.Response(), user.ID, user.PasswordHash); err != nil {
+		return err
+	}
+	a.auth.ClearRegistrationToken(c.Response())
+	if user.IsCreator {
+		return c.Redirect(http.StatusSeeOther, "/admin")
+	}
+	return c.Redirect(http.StatusSeeOther, "/")
+}
+
+func (a *App) renderRegistration(c echo.Context, status int, form Registration, message, token string) error {
+	data, err := a.baseData(c, "注册")
+	if err != nil {
+		return err
+	}
+	firstUser, err := a.repo.NeedsCreator()
+	if err != nil {
+		return err
+	}
+	data.View, data.Error, data.CSRF = "register", message, token
+	data.FirstUser, data.Registration = firstUser, form
+	return a.render(c, status, "auth", data)
+}
+
+func validateRegistration(form Registration, password, confirmation string) error {
+	if length := len(form.Username); length < 3 || length > 32 {
+		return errors.New("用户名长度应为 3 至 32 个字符")
+	}
+	for _, char := range form.Username {
+		if !((char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.') {
+			return errors.New("用户名只能包含小写字母、数字、点、下划线和连字符")
+		}
+	}
+	if length := len([]rune(form.Nickname)); length < 1 || length > 50 {
+		return errors.New("昵称长度应为 1 至 50 个字符")
+	}
+	if len([]rune(form.Email)) > 160 {
+		return errors.New("邮箱不能超过 160 个字符")
+	}
+	if _, err := mail.ParseAddress(form.Email); err != nil {
+		return errors.New("邮箱格式不正确")
+	}
+	if err := validatePassword(password); err != nil {
+		return err
+	}
+	if password != confirmation {
+		return errors.New("两次输入的密码不一致")
+	}
+	return nil
+}
+
+func (a *App) accountPage(c echo.Context) error {
+	return a.renderAccount(c, http.StatusOK, "", "")
+}
+
+func (a *App) saveAccount(c echo.Context) error {
+	user := currentUser(c)
+	switch c.FormValue("action") {
+	case "profile":
+		nickname := strings.TrimSpace(c.FormValue("nickname"))
+		email := strings.TrimSpace(c.FormValue("email"))
+		website := strings.TrimSpace(c.FormValue("website_url"))
+		formUser := *user
+		formUser.Nickname, formUser.Email, formUser.WebsiteURL = nickname, email, website
+		if length := len([]rune(nickname)); length < 1 || length > 50 {
+			return a.renderAccountForm(c, http.StatusUnprocessableEntity, "昵称长度应为 1 至 50 个字符", "", &formUser)
+		}
+		if len([]rune(email)) > 160 {
+			return a.renderAccountForm(c, http.StatusUnprocessableEntity, "邮箱不能超过 160 个字符", "", &formUser)
+		}
+		if _, err := mail.ParseAddress(email); err != nil {
+			return a.renderAccountForm(c, http.StatusUnprocessableEntity, "邮箱格式不正确", "", &formUser)
+		}
+		if len([]rune(website)) > 300 {
+			return a.renderAccountForm(c, http.StatusUnprocessableEntity, "网站地址不能超过 300 个字符", "", &formUser)
+		}
+		if website != "" && !validHTTPURL(website) {
+			return a.renderAccountForm(c, http.StatusUnprocessableEntity, "网站地址格式不正确", "", &formUser)
+		}
+		if err := a.repo.UpdateUserProfile(user.ID, nickname, email, website); err != nil {
+			return err
+		}
+		return c.Redirect(http.StatusSeeOther, "/account?saved=profile")
+	case "password":
+		if !a.auth.PasswordMatches(user.PasswordHash, c.FormValue("current_password")) {
+			return a.renderAccount(c, http.StatusUnprocessableEntity, "当前密码不正确", "")
+		}
+		password := c.FormValue("new_password")
+		if err := validatePassword(password); err != nil {
+			return a.renderAccount(c, http.StatusUnprocessableEntity, err.Error(), "")
+		}
+		if password != c.FormValue("password_confirm") {
+			return a.renderAccount(c, http.StatusUnprocessableEntity, "两次输入的新密码不一致", "")
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		if err := a.repo.UpdateUserPassword(user.ID, string(hash)); err != nil {
+			return err
+		}
+		if err := a.auth.SetSession(c.Response(), user.ID, string(hash)); err != nil {
+			return err
+		}
+		return c.Redirect(http.StatusSeeOther, "/account?saved=password")
+	default:
+		return echo.NewHTTPError(http.StatusBadRequest, "无效的账户操作")
+	}
+}
+
+func (a *App) renderAccount(c echo.Context, status int, message, notice string) error {
+	return a.renderAccountForm(c, status, message, notice, nil)
+}
+
+func (a *App) renderAccountForm(c echo.Context, status int, message, notice string, form *User) error {
+	data, err := a.baseData(c, "账户设置")
+	if err != nil {
+		return err
+	}
+	user, err := a.repo.UserByID(currentUser(c).ID)
+	if err != nil {
+		return err
+	}
+	if form != nil {
+		user.Nickname, user.Email, user.WebsiteURL = form.Nickname, form.Email, form.WebsiteURL
+	}
+	data.View, data.Error, data.User = "account", message, &user
+	if notice != "" {
+		data.Notice = notice
+	} else if saved := c.QueryParam("saved"); saved == "profile" || saved == "password" {
+		data.Notice = saved
+	}
+	return a.render(c, status, "public", data)
 }
 
 func (a *App) login(c echo.Context) error {
@@ -355,7 +536,7 @@ func (a *App) login(c echo.Context) error {
 		data.View, data.Error = "login", "用户名或密码不正确"
 		return a.render(c, http.StatusUnauthorized, "auth", data)
 	}
-	if err := a.auth.SetSession(c.Response(), user.ID); err != nil {
+	if err := a.auth.SetSession(c.Response(), user.ID, user.PasswordHash); err != nil {
 		return err
 	}
 	a.loginIPRate.Reset(ipKey)
@@ -424,20 +605,51 @@ func (a *App) adminComments(c echo.Context) error {
 func (a *App) moderateComment(c echo.Context) error {
 	id := parseID(c.Param("id"))
 	action := c.FormValue("action")
-	if err := a.repo.ModerateComment(id, action); err != nil {
-		return err
-	}
+	var urls []string
 	if action == "approve" {
 		comment, err := a.repo.CommentNotification(id)
-		if err == nil {
-			post := Post{Kind: comment.PostKind, Slug: comment.PostSlug}
-			a.queueCommentNotifications(id, absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments"), false, true)
+		if err != nil {
+			return err
 		}
+		post := Post{Kind: comment.PostKind, Slug: comment.PostSlug}
+		urls = []string{absoluteURL(c, contentURL(post)), absoluteURL(c, "/admin/comments")}
 	}
+	if err := a.repo.ModerateComment(id, action, urls...); err != nil {
+		return err
+	}
+	a.wakeNotifications()
 	return c.Redirect(http.StatusSeeOther, "/admin/comments")
 }
 
+func (a *App) adminNotifications(c echo.Context) error {
+	data, err := a.baseData(c, "邮件通知")
+	if err != nil {
+		return err
+	}
+	data.NotificationJobs, err = a.repo.NotificationJobs()
+	if err != nil {
+		return err
+	}
+	data.View = "notifications"
+	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) retryNotification(c echo.Context) error {
+	if err := a.repo.RetryNotification(parseID(c.Param("id")), c.Param("kind")); err != nil {
+		if IsNotFound(err) {
+			return echo.NewHTTPError(http.StatusConflict, "该通知无法重试，请刷新列表")
+		}
+		return err
+	}
+	a.wakeNotifications()
+	return c.Redirect(http.StatusSeeOther, "/admin/notifications")
+}
+
 func (a *App) adminCategories(c echo.Context) error {
+	return a.renderAdminCategories(c, http.StatusOK, Category{}, "")
+}
+
+func (a *App) renderAdminCategories(c echo.Context, status int, category Category, message string) error {
 	data, err := a.baseData(c, "分类管理")
 	if err != nil {
 		return err
@@ -446,20 +658,32 @@ func (a *App) adminCategories(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	data.View = "categories"
-	return a.render(c, http.StatusOK, "admin", data)
+	data.View, data.Category, data.Error = "categories", category, message
+	return a.render(c, status, "admin", data)
 }
 
 func (a *App) saveCategory(c echo.Context) error {
 	sortOrder, _ := strconv.Atoi(c.FormValue("sort_order"))
 	category := Category{ID: parseID(c.FormValue("id")), Name: strings.TrimSpace(c.FormValue("name")), Slug: slugify(c.FormValue("slug")), Description: strings.TrimSpace(c.FormValue("description")), SortOrder: sortOrder}
-	if category.Name == "" {
-		return echo.NewHTTPError(http.StatusUnprocessableEntity, "分类名称不能为空")
+	if length := len([]rune(category.Name)); length < 1 || length > 100 {
+		return a.renderAdminCategories(c, http.StatusUnprocessableEntity, category, "分类名称长度应为 1 至 100 个字符")
 	}
 	if category.Slug == "" {
 		category.Slug = slugify(category.Name)
 	}
+	if category.Slug == "" {
+		return a.renderAdminCategories(c, http.StatusUnprocessableEntity, category, "分类 Slug 不能为空")
+	}
+	if len([]rune(category.Slug)) > 180 {
+		return a.renderAdminCategories(c, http.StatusUnprocessableEntity, category, "分类 Slug 不能超过 180 个字符")
+	}
+	if len([]rune(category.Description)) > 500 {
+		return a.renderAdminCategories(c, http.StatusUnprocessableEntity, category, "分类描述不能超过 500 个字符")
+	}
 	if err := a.repo.SaveCategory(category); err != nil {
+		if isUniqueConflict(err) {
+			return a.renderAdminCategories(c, http.StatusConflict, category, "分类 Slug 已被使用")
+		}
 		return err
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/categories")
@@ -473,6 +697,10 @@ func (a *App) deleteCategory(c echo.Context) error {
 }
 
 func (a *App) adminLinks(c echo.Context) error {
+	return a.renderAdminLinks(c, http.StatusOK, Link{}, "")
+}
+
+func (a *App) renderAdminLinks(c echo.Context, status int, link Link, message string) error {
 	data, err := a.baseData(c, "友链管理")
 	if err != nil {
 		return err
@@ -481,21 +709,39 @@ func (a *App) adminLinks(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	data.View = "admin-links"
-	return a.render(c, http.StatusOK, "admin", data)
+	data.View, data.Link, data.Error = "admin-links", link, message
+	return a.render(c, status, "admin", data)
 }
 
 func (a *App) saveLink(c echo.Context) error {
 	sortOrder, _ := strconv.Atoi(c.FormValue("sort_order"))
 	link := Link{ID: parseID(c.FormValue("id")), Name: strings.TrimSpace(c.FormValue("name")), URL: strings.TrimSpace(c.FormValue("url")), IconURL: strings.TrimSpace(c.FormValue("icon_url")), Description: strings.TrimSpace(c.FormValue("description")), SortOrder: sortOrder}
-	parsed, err := url.ParseRequestURI(link.URL)
-	if link.Name == "" || err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return echo.NewHTTPError(http.StatusUnprocessableEntity, "请填写名称和有效的友链地址")
+	if length := len([]rune(link.Name)); length < 1 || length > 100 {
+		return a.renderAdminLinks(c, http.StatusUnprocessableEntity, link, "友链名称长度应为 1 至 100 个字符")
+	}
+	if len([]rune(link.URL)) > 2000 || !validHTTPURL(link.URL) {
+		return a.renderAdminLinks(c, http.StatusUnprocessableEntity, link, "请填写有效的 HTTP 或 HTTPS 友链地址")
+	}
+	if len([]rune(link.IconURL)) > 2000 {
+		return a.renderAdminLinks(c, http.StatusUnprocessableEntity, link, "图标地址不能超过 2000 个字符")
+	}
+	if link.IconURL != "" {
+		if !validHTTPURL(link.IconURL) {
+			return a.renderAdminLinks(c, http.StatusUnprocessableEntity, link, "图标必须是有效的 HTTP 或 HTTPS 地址")
+		}
+	}
+	if len([]rune(link.Description)) > 500 {
+		return a.renderAdminLinks(c, http.StatusUnprocessableEntity, link, "友链描述不能超过 500 个字符")
 	}
 	if err := a.repo.SaveLink(link); err != nil {
 		return err
 	}
 	return c.Redirect(http.StatusSeeOther, "/admin/links")
+}
+
+func validHTTPURL(value string) bool {
+	parsed, err := url.ParseRequestURI(value)
+	return err == nil && parsed.Host != "" && (strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https"))
 }
 
 func (a *App) deleteLink(c echo.Context) error {
@@ -779,19 +1025,10 @@ func (a *App) aiAction(c echo.Context) error {
 }
 
 func (a *App) editor(c echo.Context) error {
-	data, err := a.baseData(c, "写作")
+	data, err := a.editorPageData(c)
 	if err != nil {
 		return err
 	}
-	data.Categories, err = a.repo.Categories()
-	if err != nil {
-		return err
-	}
-	aiSettings, err := a.repo.AISettings()
-	if err != nil {
-		return err
-	}
-	data.AIReady = aiSettings.Ready()
 	if id := parseID(c.Param("id")); id > 0 {
 		data.Post, err = a.repo.FindPostByID(id)
 		if IsNotFound(err) {
@@ -805,6 +1042,33 @@ func (a *App) editor(c echo.Context) error {
 	}
 	data.View = "editor"
 	return a.render(c, http.StatusOK, "admin", data)
+}
+
+func (a *App) editorPageData(c echo.Context) (PageData, error) {
+	data, err := a.baseData(c, "写作")
+	if err != nil {
+		return data, err
+	}
+	data.Categories, err = a.repo.Categories()
+	if err != nil {
+		return data, err
+	}
+	aiSettings, err := a.repo.AISettings()
+	if err != nil {
+		return data, err
+	}
+	data.AIReady = aiSettings.Ready()
+	data.View = "editor"
+	return data, nil
+}
+
+func (a *App) renderEditorError(c echo.Context, status int, post Post, message string) error {
+	data, err := a.editorPageData(c)
+	if err != nil {
+		return err
+	}
+	data.Post, data.Error = post, message
+	return a.render(c, status, "admin", data)
 }
 
 func (a *App) saveEditor(c echo.Context) error {
@@ -827,18 +1091,12 @@ func (a *App) saveEditor(c echo.Context) error {
 		post.PublishedAt, post.CreatedAt, post.Views = existing.PublishedAt, existing.CreatedAt, existing.Views
 	}
 	if err := ValidatePost(post); err != nil {
-		data, dataErr := a.baseData(c, "写作")
-		if dataErr != nil {
-			return dataErr
-		}
-		data.View, data.Post, data.Error = "editor", post, err.Error()
-		data.Categories, _ = a.repo.Categories()
-		return a.render(c, http.StatusUnprocessableEntity, "admin", data)
+		return a.renderEditorError(c, http.StatusUnprocessableEntity, post, err.Error())
 	}
 	postID, err := a.repo.SavePost(post)
 	if err != nil {
 		if isUniqueConflict(err) {
-			return echo.NewHTTPError(http.StatusConflict, "Slug 已被其他内容使用")
+			return a.renderEditorError(c, http.StatusConflict, post, "Slug 已被其他内容使用")
 		}
 		return err
 	}

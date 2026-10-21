@@ -15,16 +15,18 @@
 <aside class="admin-sidebar">
 <a class="brand" href="/">{{.Settings.Name}}</a>
 <nav>
-<a href="/admin" class="{{if eq .View "dashboard"}}active{{end}}">概览</a>
-<a href="/admin/posts" class="{{if eq .View "posts"}}active{{end}}">内容</a>
-<a href="/admin/write" class="{{if eq .View "editor"}}active{{end}}">写作</a>
-<a href="/admin/comments" class="{{if eq .View "comments"}}active{{end}}">评论</a>
-<a href="/admin/categories" class="{{if eq .View "categories"}}active{{end}}">分类</a>
-<a href="/admin/links" class="{{if eq .View "admin-links"}}active{{end}}">友链</a>
-<a href="/admin/settings" class="{{if eq .View "settings"}}active{{end}}">设置</a>
+<a href="/admin" class="{{if eq .View "dashboard"}}active{{end}}" {{if eq .View "dashboard"}}aria-current="page"{{end}}>概览</a>
+<a href="/admin/posts" class="{{if eq .View "posts"}}active{{end}}" {{if eq .View "posts"}}aria-current="page"{{end}}>内容</a>
+<a href="/admin/write" class="{{if eq .View "editor"}}active{{end}}" {{if eq .View "editor"}}aria-current="page"{{end}}>写作</a>
+<a href="/admin/comments" class="{{if eq .View "comments"}}active{{end}}" {{if eq .View "comments"}}aria-current="page"{{end}}>评论</a>
+<a href="/admin/notifications" class="{{if eq .View "notifications"}}active{{end}}" {{if eq .View "notifications"}}aria-current="page"{{end}}>邮件通知</a>
+<a href="/admin/categories" class="{{if eq .View "categories"}}active{{end}}" {{if eq .View "categories"}}aria-current="page"{{end}}>分类</a>
+<a href="/admin/links" class="{{if eq .View "admin-links"}}active{{end}}" {{if eq .View "admin-links"}}aria-current="page"{{end}}>友链</a>
+<a href="/admin/settings" class="{{if eq .View "settings"}}active{{end}}" {{if eq .View "settings"}}aria-current="page"{{end}}>设置</a>
 </nav>
 <div class="sidebar-account">
 <div class="sidebar-user"><span class="avatar">{{firstRune .User.DisplayName}}</span><span>{{.User.DisplayName}}</span></div>
+<a class="ghost-button" href="/account">账户设置</a>
 <form method="post" action="/logout">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <button class="ghost-button" type="submit">退出登录</button>
@@ -39,6 +41,7 @@
 </div>
 <a class="ghost-button admin-view-site" href="/" target="_blank" rel="noopener">查看站点</a>
 </header>
+{{if eq .View "notifications"}}{{template "admin-notifications" .}}{{end}}
 {{if eq .View "dashboard"}}{{template "dashboard" .}}{{end}}{{if eq .View "posts"}}{{template "admin-posts" .}}{{end}}{{if eq .View "editor"}}{{template "editor" .}}{{end}}{{if eq .View "comments"}}{{template "admin-comments" .}}{{end}}{{if eq .View "categories"}}{{template "admin-categories" .}}{{end}}{{if eq .View "admin-links"}}{{template "admin-links" .}}{{end}}{{if eq .View "settings"}}{{template "settings" .}}{{end}}
 </main>
 </div>
@@ -77,6 +80,17 @@
 <a class="primary-button" href="/admin/write">新建内容</a>
 </section>{{end}}
 
+{{define "admin-notifications"}}
+<p>显示最近 100 条通知。发送失败后会自动重试，最多尝试 8 次；关闭邮件通知时暂停发送。</p>
+<div class="comment-admin-list">
+{{range .NotificationJobs}}<article class="comment-admin-item">
+<header><div><strong>评论 #{{.CommentID}} · {{if eq .Kind "admin"}}新评论通知{{else}}回复通知{{end}}</strong><span>{{date .CreatedAt "2006-01-02 15:04"}}</span></div><span>{{.State}}</span></header>
+<p>已尝试 {{.Attempts}} 次{{if .LastError}} · {{.LastError}}{{end}}</p>
+{{if .FailedAt}}<footer><form method="post" action="/admin/notifications/{{.CommentID}}/{{.Kind}}/retry"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">重新发送</button></form></footer>{{end}}
+</article>{{else}}<div class="empty-state">还没有邮件通知任务。</div>{{end}}
+</div>
+{{end}}
+
 {{define "admin-posts"}}<div class="admin-actions">
 <p>共 {{len .Posts}} 条内容</p>
 <a class="primary-button" href="/admin/write">新建内容</a>
@@ -100,7 +114,7 @@
 <time>{{date .UpdatedAt "2006-01-02"}}</time>
 <div class="row-actions">
 <a href="/admin/edit/{{.ID}}">编辑</a>
-<form method="post" action="/admin/delete/{{.ID}}" onsubmit="return confirm('确定删除这条内容吗？');">
+<form method="post" action="/admin/delete/{{.ID}}" data-confirm="确定删除这条内容吗？删除后无法恢复。">
 <input type="hidden" name="csrf" value="{{$.CSRF}}">
 <button type="submit">删除</button>
 </form>
@@ -144,7 +158,7 @@
 <input type="checkbox" name="is_pinned" value="1" {{if .Post.Pinned}}checked{{end}}>置顶</label>
 <label class="check">
 <input type="checkbox" name="allow_comments" value="1" {{if .Post.AllowComments}}checked{{end}}>允许评论</label>
-<button class="primary-button" type="submit">保存内容</button>{{if .Post.ID}}<a class="ghost-button" href="{{if eq .Post.Kind "page"}}/{{pathEscape .Post.Slug}}{{else}}/archive/{{pathEscape .Post.Slug}}{{end}}" target="_blank">预览</a>{{end}}</aside>
+<button class="primary-button" type="submit">保存内容</button>{{if .Post.ID}}<a class="ghost-button" href="{{if eq .Post.Kind "page"}}/{{pathEscape .Post.Slug}}{{else}}/archive/{{pathEscape .Post.Slug}}{{end}}" target="_blank" rel="noopener">预览</a>{{end}}</aside>
 </form>{{end}}
 
 {{define "admin-comments"}}<div class="comment-admin-list">{{range .AdminComments}}<article class="comment-admin-item">
@@ -159,28 +173,28 @@
 <footer>
 <a href="/archive/{{pathEscape .PostSlug}}#comment-{{.ID}}">{{.PostTitle}}</a>
 <form method="post" action="/admin/comments/{{.ID}}">
-<input type="hidden" name="csrf" value="{{$.CSRF}}">{{if eq .Status "approved"}}<button name="action" value="pending" type="submit">转为待审核</button>{{else}}<button name="action" value="approve" type="submit">批准</button>{{end}}<button class="danger-action" name="action" value="delete" type="submit">删除</button>
+<input type="hidden" name="csrf" value="{{$.CSRF}}">{{if eq .Status "approved"}}<button name="action" value="pending" type="submit">转为待审核</button>{{else}}<button name="action" value="approve" type="submit">批准</button>{{end}}<button class="danger-action" name="action" value="delete" type="submit" data-confirm="确定删除这条评论吗？删除后无法恢复。">删除</button>
 </form>
 </footer>
 </article>{{else}}<div class="empty-state">还没有评论。</div>{{end}}</div>{{end}}
 
-{{define "admin-categories"}}<div class="manage-grid">
+{{define "admin-categories"}}{{if .Error}}<div class="form-error" role="alert">{{.Error}}</div>{{end}}<div class="manage-grid">
 <section>
 <h2>现有分类</h2>
 <div class="manage-list">{{range .Categories}}<form method="post" action="/admin/categories">
 <input type="hidden" name="csrf" value="{{$.CSRF}}">
 <input type="hidden" name="id" value="{{.ID}}">
-<label>名称<input name="name" value="{{.Name}}" required>
+<label>名称<input name="name" value="{{if eq .ID $.Category.ID}}{{$.Category.Name}}{{else}}{{.Name}}{{end}}" maxlength="100" required>
 </label>
-<label>Slug<input name="slug" value="{{.Slug}}" required>
+<label>Slug<input name="slug" value="{{if eq .ID $.Category.ID}}{{$.Category.Slug}}{{else}}{{.Slug}}{{end}}" maxlength="180" required>
 </label>
-<label>描述<input name="description" value="{{.Description}}">
+<label>描述<input name="description" value="{{if eq .ID $.Category.ID}}{{$.Category.Description}}{{else}}{{.Description}}{{end}}" maxlength="500">
 </label>
 <label>排序<input type="number" name="sort_order" value="{{.SortOrder}}">
 </label>
 <div class="manage-actions">
 <button class="ghost-button" type="submit">保存</button>
-<button class="danger-action" type="submit" formaction="/admin/categories/{{.ID}}/delete">删除</button>
+<button class="danger-action" type="submit" formaction="/admin/categories/{{.ID}}/delete" data-confirm="确定删除这个分类吗？">删除</button>
 </div>
 </form>{{else}}<p class="empty-inline">还没有分类。</p>{{end}}</div>
 </section>
@@ -188,12 +202,11 @@
 <h2>添加分类</h2>
 <form class="settings-form" method="post" action="/admin/categories">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
-<label>名称<input name="name" required>
+<label>名称<input name="name" value="{{if eq .Category.ID 0}}{{.Category.Name}}{{end}}" maxlength="100" required>
 </label>
-<label>Slug<input name="slug" placeholder="自动根据名称生成">
+<label>Slug<input name="slug" value="{{if eq .Category.ID 0}}{{.Category.Slug}}{{end}}" maxlength="180" placeholder="自动根据名称生成">
 </label>
-<label>描述<textarea name="description" rows="3">
-</textarea>
+<label>描述<textarea name="description" rows="3" maxlength="500">{{if eq .Category.ID 0}}{{.Category.Description}}{{end}}</textarea>
 </label>
 <label>排序<input type="number" name="sort_order" value="0">
 </label>
@@ -202,25 +215,25 @@
 </section>
 </div>{{end}}
 
-{{define "admin-links"}}<div class="manage-grid">
+{{define "admin-links"}}{{if .Error}}<div class="form-error" role="alert">{{.Error}}</div>{{end}}<div class="manage-grid">
 <section>
 <h2>现有友链</h2>
 <div class="manage-list">{{range .Links}}<form method="post" action="/admin/links">
 <input type="hidden" name="csrf" value="{{$.CSRF}}">
 <input type="hidden" name="id" value="{{.ID}}">
-<label>名称<input name="name" value="{{.Name}}" required>
+<label>名称<input name="name" value="{{if eq .ID $.Link.ID}}{{$.Link.Name}}{{else}}{{.Name}}{{end}}" maxlength="100" required>
 </label>
-<label>地址<input type="url" name="url" value="{{.URL}}" required>
+<label>地址<input type="url" name="url" value="{{if eq .ID $.Link.ID}}{{$.Link.URL}}{{else}}{{.URL}}{{end}}" maxlength="2000" required>
 </label>
-<label>图标<input type="url" name="icon_url" value="{{.IconURL}}">
+<label>图标<input type="url" name="icon_url" value="{{if eq .ID $.Link.ID}}{{$.Link.IconURL}}{{else}}{{.IconURL}}{{end}}" maxlength="2000">
 </label>
-<label>描述<input name="description" value="{{.Description}}">
+<label>描述<input name="description" value="{{if eq .ID $.Link.ID}}{{$.Link.Description}}{{else}}{{.Description}}{{end}}" maxlength="500">
 </label>
 <label>排序<input type="number" name="sort_order" value="{{.SortOrder}}">
 </label>
 <div class="manage-actions">
 <button class="ghost-button" type="submit">保存</button>
-<button class="danger-action" type="submit" formaction="/admin/links/{{.ID}}/delete">删除</button>
+<button class="danger-action" type="submit" formaction="/admin/links/{{.ID}}/delete" data-confirm="确定删除这条友链吗？">删除</button>
 </div>
 </form>{{else}}<p class="empty-inline">还没有友链。</p>{{end}}</div>
 </section>
@@ -228,14 +241,13 @@
 <h2>添加友链</h2>
 <form class="settings-form" method="post" action="/admin/links">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
-<label>名称<input name="name" required>
+<label>名称<input name="name" value="{{if eq .Link.ID 0}}{{.Link.Name}}{{end}}" maxlength="100" required>
 </label>
-<label>地址<input type="url" name="url" placeholder="https://" required>
+<label>地址<input type="url" name="url" value="{{if eq .Link.ID 0}}{{.Link.URL}}{{end}}" maxlength="2000" placeholder="https://" required>
 </label>
-<label>图标<input type="url" name="icon_url" placeholder="https://">
+<label>图标<input type="url" name="icon_url" value="{{if eq .Link.ID 0}}{{.Link.IconURL}}{{end}}" maxlength="2000" placeholder="https://">
 </label>
-<label>描述<textarea name="description" rows="3">
-</textarea>
+<label>描述<textarea name="description" rows="3" maxlength="500">{{if eq .Link.ID 0}}{{.Link.Description}}{{end}}</textarea>
 </label>
 <label>排序<input type="number" name="sort_order" value="0">
 </label>

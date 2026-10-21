@@ -15,14 +15,21 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 )
 
 func newTestApp(t *testing.T) *App {
+	app := newEmptyTestApp(t)
+	addTestUser(t, app, "admin", "test-password")
+	return app
+}
+
+func newEmptyTestApp(t *testing.T) *App {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "blog.sqlite")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -39,7 +46,7 @@ func newTestApp(t *testing.T) *App {
 
 func TestFreshDatabasePublicRoutes(t *testing.T) {
 	app := newTestApp(t)
-	for _, path := range []string{"/", "/archives", "/tags", "/links", "/rss.xml", "/sitemap.xml", "/login", "/healthz"} {
+	for _, path := range []string{"/", "/archives", "/tags", "/links", "/rss.xml", "/sitemap.xml", "/login", "/register", "/healthz"} {
 		t.Run(path, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, path, nil)
 			response := httptest.NewRecorder()
@@ -48,6 +55,122 @@ func TestFreshDatabasePublicRoutes(t *testing.T) {
 				t.Fatalf("GET %s status = %d, body = %s", path, response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestRegistrationCreatesCreatorThenSubscriber(t *testing.T) {
+	app := newEmptyTestApp(t)
+	register := func(username string) *httptest.ResponseRecorder {
+		pageRequest := httptest.NewRequest(http.MethodGet, "/register", nil)
+		pageResponse := httptest.NewRecorder()
+		app.Handler().ServeHTTP(pageResponse, pageRequest)
+		if pageResponse.Code != http.StatusOK {
+			t.Fatalf("registration page status=%d", pageResponse.Code)
+		}
+		csrf := hiddenInputValue(t, pageResponse.Body.String(), "csrf")
+		cookies := pageResponse.Result().Cookies()
+		if len(cookies) == 0 {
+			t.Fatal("registration page did not set a CSRF cookie")
+		}
+		form := url.Values{
+			"csrf": {csrf}, "username": {username}, "nickname": {username},
+			"email": {username + "@example.com"}, "password": {"secure-password"},
+			"password_confirm": {"secure-password"},
+		}
+		request := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.RemoteAddr = "192.0.2.80:1234"
+		request.AddCookie(cookies[0])
+		response := httptest.NewRecorder()
+		app.Handler().ServeHTTP(response, request)
+		return response
+	}
+
+	first := register("owner")
+	if first.Code != http.StatusSeeOther || first.Header().Get("Location") != "/admin" {
+		t.Fatalf("first registration status=%d location=%q body=%s", first.Code, first.Header().Get("Location"), first.Body.String())
+	}
+	owner, err := app.repo.UserByUsername("owner")
+	if err != nil || !owner.IsCreator {
+		t.Fatalf("first user is not creator: user=%#v err=%v", owner, err)
+	}
+
+	second := register("reader")
+	if second.Code != http.StatusSeeOther || second.Header().Get("Location") != "/" {
+		t.Fatalf("second registration status=%d location=%q body=%s", second.Code, second.Header().Get("Location"), second.Body.String())
+	}
+	reader, err := app.repo.UserByUsername("reader")
+	if err != nil || reader.IsCreator {
+		t.Fatalf("second user has incorrect role: user=%#v err=%v", reader, err)
+	}
+	app.registerIPRate.mu.Lock()
+	registrationAttempts := app.registerIPRate.entries["192.0.2.80"].count
+	app.registerIPRate.mu.Unlock()
+	if registrationAttempts != 2 {
+		t.Fatalf("successful registrations reset rate limit count: count=%d", registrationAttempts)
+	}
+}
+
+func TestAccountProfileAndPasswordUpdate(t *testing.T) {
+	app := newTestApp(t)
+	cookie, _ := loginTestUser(t, app, "admin", "test-password", "")
+	claimsRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	claimsRequest.AddCookie(cookie)
+	claims, err := app.auth.Claims(claimsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf := app.auth.CSRF(claims)
+
+	profile := url.Values{
+		"csrf": {csrf}, "action": {"profile"}, "nickname": {"站长"},
+		"email": {"owner@example.com"}, "website_url": {"https://example.com"},
+	}
+	profileRequest := httptest.NewRequest(http.MethodPost, "/account", strings.NewReader(profile.Encode()))
+	profileRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	profileRequest.AddCookie(cookie)
+	profileResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(profileResponse, profileRequest)
+	if profileResponse.Code != http.StatusSeeOther || profileResponse.Header().Get("Location") != "/account?saved=profile" {
+		t.Fatalf("profile status=%d body=%s", profileResponse.Code, profileResponse.Body.String())
+	}
+	user, err := app.repo.UserByUsername("admin")
+	if err != nil || user.Nickname != "站长" || user.Email != "owner@example.com" || user.WebsiteURL != "https://example.com" {
+		t.Fatalf("profile was not updated: user=%#v err=%v", user, err)
+	}
+
+	invalidProfile := url.Values{
+		"csrf": {csrf}, "action": {"profile"}, "nickname": {"未保存的昵称"},
+		"email": {"draft@example.com"}, "website_url": {"https:example.com"},
+	}
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/account", strings.NewReader(invalidProfile.Encode()))
+	invalidRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	invalidRequest.AddCookie(cookie)
+	invalidResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusUnprocessableEntity || !strings.Contains(invalidResponse.Body.String(), "未保存的昵称") {
+		t.Fatalf("invalid profile status=%d body=%s", invalidResponse.Code, invalidResponse.Body.String())
+	}
+	user, err = app.repo.UserByUsername("admin")
+	if err != nil || user.Nickname != "站长" || user.WebsiteURL != "https://example.com" {
+		t.Fatalf("invalid profile was persisted: user=%#v err=%v", user, err)
+	}
+
+	password := url.Values{
+		"csrf": {csrf}, "action": {"password"}, "current_password": {"test-password"},
+		"new_password": {"new-secure-password"}, "password_confirm": {"new-secure-password"},
+	}
+	passwordRequest := httptest.NewRequest(http.MethodPost, "/account", strings.NewReader(password.Encode()))
+	passwordRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	passwordRequest.AddCookie(cookie)
+	passwordResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(passwordResponse, passwordRequest)
+	if passwordResponse.Code != http.StatusSeeOther || passwordResponse.Header().Get("Location") != "/account?saved=password" {
+		t.Fatalf("password status=%d body=%s", passwordResponse.Code, passwordResponse.Body.String())
+	}
+	updated, err := app.repo.UserByUsername("admin")
+	if err != nil || !app.auth.PasswordMatches(updated.PasswordHash, "new-secure-password") || app.auth.PasswordMatches(updated.PasswordHash, "test-password") {
+		t.Fatalf("password was not updated: err=%v", err)
 	}
 }
 
@@ -278,6 +401,70 @@ func TestAuthenticatedAdminRoutesAndUpload(t *testing.T) {
 	}
 }
 
+func TestAdminCategoryConflictRendersEditableForm(t *testing.T) {
+	app := newTestApp(t)
+	if err := app.repo.SaveCategory(Category{Name: "Existing", Slug: "existing"}); err != nil {
+		t.Fatal(err)
+	}
+	cookie, _ := loginTestUser(t, app, "admin", "test-password", "")
+	claimsRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	claimsRequest.AddCookie(cookie)
+	claims, err := app.auth.Claims(claimsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"csrf": {app.auth.CSRF(claims)}, "name": {"Duplicate"}, "slug": {"existing"},
+		"description": {"kept description"}, "sort_order": {"3"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin/categories", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("category conflict status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "分类 Slug 已被使用") || !strings.Contains(body, `value="Duplicate"`) || !strings.Contains(body, "kept description") {
+		t.Fatalf("category conflict did not preserve form values: %s", body)
+	}
+}
+
+func TestAdminLinkRejectsIconURLWithoutHost(t *testing.T) {
+	app := newTestApp(t)
+	cookie, _ := loginTestUser(t, app, "admin", "test-password", "")
+	claimsRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	claimsRequest.AddCookie(cookie)
+	claims, err := app.auth.Claims(claimsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"csrf": {app.auth.CSRF(claims)}, "name": {"Example"}, "url": {"https://example.com"},
+		"icon_url": {"https:icon.png"}, "description": {"kept description"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin/links", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid icon URL status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "图标必须是有效的 HTTP 或 HTTPS 地址") || !strings.Contains(body, `value="https:icon.png"`) {
+		t.Fatalf("invalid link form did not preserve values: %s", body)
+	}
+	links, err := app.repo.Links()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("invalid link was persisted: %#v", links)
+	}
+}
+
 func TestExcerptNormalizesStoredMarkdown(t *testing.T) {
 	post := Post{Excerpt: "# Heading\n\n- first\n- [second](https://example.com)\n\n```go\nsecret()\n```"}
 	got := DeriveExcerpt(post, 200)
@@ -309,6 +496,13 @@ func TestDatabaseSchemaValidation(t *testing.T) {
 	app := newTestApp(t)
 	if err := app.database.Validate(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	var migrations int
+	if err := app.database.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version=1").Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 1 {
+		t.Fatalf("baseline migration count=%d", migrations)
 	}
 }
 
@@ -563,6 +757,68 @@ func TestCommentNotificationsSendAdminAndReplyOnce(t *testing.T) {
 	}
 	if notifiedAt == 0 {
 		t.Fatal("reply notification was not marked as sent")
+	}
+}
+
+func TestConcurrentReplyNotificationUsesSingleClaim(t *testing.T) {
+	app := newTestApp(t)
+	creator, err := app.repo.UserByUsername("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	postID, err := app.repo.SavePost(Post{
+		AuthorID: creator.ID, Slug: "notification-claim", Title: "Notification claim", Content: "Body",
+		Kind: "post", Status: "published", AllowComments: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.repo.SaveAdminSettings(map[string]string{"comments_notify": "1"}, MailSettings{
+		Enabled: true, Encryption: "starttls", Host: "smtp.example.com", Port: 587,
+		FromEmail: "sender@example.com", NotifyEmail: "owner@example.com",
+	}, S3Settings{}, AISettings{}); err != nil {
+		t.Fatal(err)
+	}
+	parentID, err := app.repo.CreateCommentReturningID(Comment{
+		PostID: postID, AuthorName: "Alice", AuthorEmail: "alice@example.com", Content: "Parent",
+	}, "parent", "192.0.2.1", "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyID, err := app.repo.CreateCommentReturningID(Comment{
+		PostID: postID, ParentID: parentID, ReplyToName: "Alice",
+		AuthorName: "Bob", AuthorEmail: "bob@example.com", Content: "Reply",
+	}, "reply", "192.0.2.2", "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sends atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	app.sendMail = func(_ context.Context, _ MailSettings, recipient, _, _ string) error {
+		if recipient == "alice@example.com" {
+			sends.Add(1)
+			once.Do(func() { close(entered) })
+			<-release
+		}
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- app.sendCommentNotifications(context.Background(), replyID, "https://blog.example/post", "", false, true)
+	}()
+	<-entered
+	if err := app.sendCommentNotifications(context.Background(), replyID, "https://blog.example/post", "", false, true); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("reply notification sends=%d", sends.Load())
 	}
 }
 
@@ -823,6 +1079,135 @@ func TestAIRequestBodyLimitRunsBeforeCSRFParsing(t *testing.T) {
 	}
 }
 
+func TestAdminAPIErrorsReturnJSON(t *testing.T) {
+	app := newTestApp(t)
+	unauthenticatedRequest := httptest.NewRequest(http.MethodPost, "/admin/ai", strings.NewReader("action=summary"))
+	unauthenticatedRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	unauthenticatedResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(unauthenticatedResponse, unauthenticatedRequest)
+	if unauthenticatedResponse.Code != http.StatusUnauthorized ||
+		!strings.HasPrefix(unauthenticatedResponse.Header().Get("Content-Type"), "application/json") ||
+		!strings.Contains(unauthenticatedResponse.Body.String(), "登录已过期，请重新登录") {
+		t.Fatalf("unauthenticated response status=%d content-type=%q body=%s", unauthenticatedResponse.Code,
+			unauthenticatedResponse.Header().Get("Content-Type"), unauthenticatedResponse.Body.String())
+	}
+
+	cookie, _ := loginTestUser(t, app, "admin", resetAdminPassword(t, app), "")
+	claimsRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	claimsRequest.AddCookie(cookie)
+	claims, err := app.auth.Claims(claimsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf := app.auth.CSRF(claims)
+	tests := []struct {
+		path       string
+		form       url.Values
+		wantStatus int
+		wantError  string
+	}{
+		{
+			path: "/admin/ai", form: url.Values{
+				"csrf": {csrf}, "action": {"summary"}, "content": {"正文"},
+			},
+			wantStatus: http.StatusServiceUnavailable, wantError: "请先在设置中配置 AI",
+		},
+		{
+			path: "/admin/upload", form: url.Values{"csrf": {csrf}},
+			wantStatus: http.StatusBadRequest, wantError: "请选择不超过 10MB 的文件",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			request.AddCookie(cookie)
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+				t.Fatalf("content type=%q", contentType)
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["message"] != test.wantError {
+				t.Fatalf("message=%q", payload["message"])
+			}
+		})
+	}
+}
+
+func TestEditorConflictPreservesContentAndAIState(t *testing.T) {
+	app := newTestApp(t)
+	creator, err := app.repo.UserByUsername("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.repo.SavePost(Post{
+		AuthorID: creator.ID, Title: "已有内容", Slug: "existing", Content: "正文",
+		Kind: "post", Status: "draft", AllowComments: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.repo.SaveAdminSettings(nil, MailSettings{}, S3Settings{}, AISettings{
+		APIURL: "https://api.example.com/v1", APIKey: "secret", Model: "model",
+		SummaryPrompt: defaultAISummaryPrompt, SlugPrompt: defaultAISlugPrompt, PolishPrompt: defaultAIPolishPrompt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cookie, _ := loginTestUser(t, app, "admin", resetAdminPassword(t, app), "")
+	claimsRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	claimsRequest.AddCookie(cookie)
+	claims, err := app.auth.Claims(claimsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{
+		"csrf": {app.auth.CSRF(claims)}, "title": {"尚未保存的标题"}, "slug": {"existing"},
+		"excerpt": {"尚未保存的摘要"}, "content": {"尚未保存的正文"}, "kind": {"post"}, "status": {"draft"},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin/write", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, value := range []string{"Slug 已被其他内容使用", "尚未保存的标题", "尚未保存的摘要", "尚未保存的正文", `data-ready="1"`} {
+		if !strings.Contains(body, value) {
+			t.Fatalf("editor response does not contain %q", value)
+		}
+	}
+}
+
+func TestValidatePostFieldLimits(t *testing.T) {
+	base := Post{Title: "标题", Slug: "slug", Excerpt: "摘要", Kind: "post", Status: "draft"}
+	tests := []struct {
+		name string
+		edit func(*Post)
+		want string
+	}{
+		{name: "title", edit: func(post *Post) { post.Title = strings.Repeat("标", 201) }, want: "标题不能超过 200 个字符"},
+		{name: "slug", edit: func(post *Post) { post.Slug = strings.Repeat("s", 181) }, want: "Slug 不能超过 180 个字符"},
+		{name: "excerpt", edit: func(post *Post) { post.Excerpt = strings.Repeat("摘", 501) }, want: "摘要不能超过 500 个字符"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			post := base
+			test.edit(&post)
+			if err := ValidatePost(post); err == nil || err.Error() != test.want {
+				t.Fatalf("ValidatePost() error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestMissingLocalUploadRedirectsToS3(t *testing.T) {
 	app := newTestApp(t)
 	if err := app.repo.SaveAdminSettings(nil, MailSettings{}, S3Settings{
@@ -902,21 +1287,7 @@ func addTestUser(t *testing.T, app *App, username, password string) User {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := app.database.Exec(
-		`INSERT INTO users(username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
-qq_url,wechat_url,weibo_url,x_url,telegram_url,mastodon_url,bilibili_url,instagram_url,tiktok_url)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		username, string(hash), username, username+"@example.com", "", "", "", time.Now().Unix(),
-		"", "", "", "", "", "", "", "", "",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		t.Fatal(err)
-	}
-	user, err := app.repo.UserByID(id)
+	user, err := app.repo.CreateUser(username, string(hash), username, username+"@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,6 +1327,21 @@ func loginTestUser(t *testing.T, app *App, username, password, next string) (*ht
 		t.Fatal("login did not set a session cookie")
 	}
 	return cookies[0], response
+}
+
+func hiddenInputValue(t *testing.T, body, name string) string {
+	t.Helper()
+	marker := `name="` + name + `" value="`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("hidden input %q not found", name)
+	}
+	start += len(marker)
+	end := strings.Index(body[start:], `"`)
+	if end < 0 {
+		t.Fatalf("hidden input %q has no closing quote", name)
+	}
+	return body[start : start+end]
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

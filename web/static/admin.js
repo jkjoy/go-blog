@@ -1,3 +1,16 @@
+async function adminResponseData(response) {
+  "use strict";
+  var type = response.headers.get("content-type") || "";
+  if (type.indexOf("application/json") !== -1) return response.json();
+  var text = await response.text();
+  return { message: text.trim() };
+}
+
+function markdownLabel(value) {
+  "use strict";
+  return value.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
+}
+
 (function () {
   "use strict";
   var picker = document.getElementById("attachment-file");
@@ -16,15 +29,17 @@
     body.append("file", file);
     try {
       var response = await fetch("/admin/upload", { method: "POST", body: body, credentials: "same-origin" });
-      var result = await response.json();
+      var result = await adminResponseData(response);
       if (!response.ok) throw new Error(result.message || "上传失败");
       var image = file.type.indexOf("image/") === 0;
-      var markdown = image ? "![" + file.name + "](" + result.url + ")" : "[" + file.name + "](" + result.url + ")";
+      var label = markdownLabel(file.name);
+      var markdown = image ? "![" + label + "](" + result.url + ")" : "[" + label + "](" + result.url + ")";
       var start = editor.selectionStart;
       var before = editor.value.slice(0, start);
       var after = editor.value.slice(editor.selectionEnd);
       var prefix = before && !before.endsWith("\n") ? "\n\n" : "";
       editor.value = before + prefix + markdown + "\n" + after;
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
       editor.focus();
       editor.selectionStart = editor.selectionEnd = (before + prefix + markdown + "\n").length;
       status.textContent = "已插入 " + file.name;
@@ -34,6 +49,30 @@
       picker.value = "";
       picker.disabled = false;
     }
+  });
+})();
+
+(function () {
+  "use strict";
+  document.addEventListener("submit", function (event) {
+    var submitter = event.submitter;
+    var message = (submitter && submitter.dataset.confirm) || event.target.dataset.confirm;
+    if (message && !window.confirm(message)) event.preventDefault();
+  });
+
+  var form = document.querySelector("form.editor");
+  if (!form) return;
+  var dirty = false;
+  var submitting = false;
+  form.addEventListener("input", function () { dirty = true; });
+  form.addEventListener("change", function () { dirty = true; });
+  form.addEventListener("submit", function (event) {
+    if (!event.defaultPrevented) submitting = true;
+  });
+  window.addEventListener("beforeunload", function (event) {
+    if (!dirty || submitting) return;
+    event.preventDefault();
+    event.returnValue = "";
   });
 })();
 
@@ -75,7 +114,7 @@
 
       try {
         var response = await fetch("/admin/ai", { method: "POST", body: body, credentials: "same-origin" });
-        var result = await response.json();
+        var result = await adminResponseData(response);
         if (!response.ok) throw new Error(result.message || "AI 操作失败");
         if (action === "summary") {
           excerpt.value = result.result;

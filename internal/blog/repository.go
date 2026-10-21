@@ -476,7 +476,12 @@ func (r *Repository) CreateComment(comment Comment, ipHash, ip, userAgent string
 	return err
 }
 
-func (r *Repository) CreateCommentReturningID(comment Comment, ipHash, ip, userAgent string, requireApproval bool) (int64, error) {
+func (r *Repository) CreateCommentReturningID(comment Comment, ipHash, ip, userAgent string, requireApproval bool, notificationURLs ...string) (int64, error) {
+	tx, err := r.db.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	status := "approved"
 	if requireApproval {
 		status = "pending"
@@ -488,23 +493,32 @@ VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,0,?,?)`
 	args := []any{comment.PostID, nullableID(comment.UserID), nullableID(comment.ParentID),
 		comment.ReplyToName, comment.AuthorName, comment.AuthorEmail, comment.AuthorURL, comment.Content,
 		status, ipHash, ip, userAgent, now, now}
+	var id int64
 	if r.db.Dialect == "postgres" {
-		var id int64
-		err := r.db.QueryRow(query+" RETURNING id", args...).Scan(&id)
-		return id, err
+		err = tx.QueryRow(r.db.Bind(query+" RETURNING id"), args...).Scan(&id)
+	} else {
+		var result sql.Result
+		result, err = tx.Exec(r.db.Bind(query), args...)
+		if err == nil {
+			id, err = result.LastInsertId()
+		}
 	}
-	result, err := r.db.Exec(query, args...)
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	if len(notificationURLs) == 2 {
+		if err := r.enqueueNotifications(tx, id, notificationURLs[0], notificationURLs[1], true, !requireApproval); err != nil {
+			return 0, err
+		}
+	}
+	return id, tx.Commit()
 }
 
 func (r *Repository) UserByUsername(username string) (User, error) {
 	var user User
 	var creator int
 	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
-CASE WHEN id=(SELECT MIN(id) FROM users) THEN 1 ELSE 0 END
+CASE WHEN id=(SELECT creator_id FROM site_identity WHERE id=1) THEN 1 ELSE 0 END
 FROM users WHERE username=?`, username).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Nickname,
 		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt, &creator)
 	user.IsCreator = creator != 0
@@ -515,11 +529,71 @@ func (r *Repository) UserByID(id int64) (User, error) {
 	var user User
 	var creator int
 	err := r.db.QueryRow(`SELECT id,username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
-CASE WHEN id=(SELECT MIN(id) FROM users) THEN 1 ELSE 0 END
+CASE WHEN id=(SELECT creator_id FROM site_identity WHERE id=1) THEN 1 ELSE 0 END
 FROM users WHERE id=?`, id).Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Nickname,
 		&user.Email, &user.AvatarURL, &user.WebsiteURL, &user.Signature, &user.CreatedAt, &creator)
 	user.IsCreator = creator != 0
 	return user, err
+}
+
+func (r *Repository) UserCount() (int, error) {
+	var count int
+	err := r.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	return count, err
+}
+
+func (r *Repository) NeedsCreator() (bool, error) {
+	var creator sql.NullInt64
+	err := r.db.QueryRow("SELECT creator_id FROM site_identity WHERE id=1").Scan(&creator)
+	return !creator.Valid, err
+}
+
+func (r *Repository) CreateUser(username, passwordHash, nickname, email string) (User, error) {
+	tx, err := r.db.DB.Begin()
+	if err != nil {
+		return User{}, err
+	}
+	defer tx.Rollback()
+	// Lock the singleton before allocating an ID so concurrent registrations
+	// cannot both become the creator, including on PostgreSQL and MySQL.
+	if _, err := tx.Exec("UPDATE site_identity SET creator_id=creator_id WHERE id=1"); err != nil {
+		return User{}, err
+	}
+	now := time.Now().Unix()
+	query := `INSERT INTO users(username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
+qq_url,wechat_url,weibo_url,x_url,telegram_url,mastodon_url,bilibili_url,instagram_url,tiktok_url)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	args := []any{username, passwordHash, nickname, email, "", "", "", now, "", "", "", "", "", "", "", "", ""}
+	var id int64
+	if r.db.Dialect == "postgres" {
+		err = tx.QueryRow(r.db.Bind(query+" RETURNING id"), args...).Scan(&id)
+	} else {
+		var result sql.Result
+		result, err = tx.Exec(r.db.Bind(query), args...)
+		if err == nil {
+			id, err = result.LastInsertId()
+		}
+	}
+	if err != nil {
+		return User{}, err
+	}
+	if _, err := tx.Exec(r.db.Bind("UPDATE site_identity SET creator_id=? WHERE id=1 AND creator_id IS NULL"), id); err != nil {
+		return User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, err
+	}
+	return r.UserByID(id)
+}
+
+func (r *Repository) UpdateUserProfile(id int64, nickname, email, websiteURL string) error {
+	_, err := r.db.Exec("UPDATE users SET nickname=?,email=?,website_url=? WHERE id=?", nickname, email, websiteURL, id)
+	return err
+}
+
+func (r *Repository) UpdateUserPassword(id int64, passwordHash string) error {
+	_, err := r.db.Exec("UPDATE users SET password_hash=? WHERE id=?", passwordHash, id)
+	return err
 }
 
 func (r *Repository) TrackView(postID int64, ipHash string) error {
@@ -651,25 +725,62 @@ LEFT JOIN comments parent ON parent.id=c.parent_id WHERE c.id=?`, id).Scan(
 	return item, err
 }
 
-func (r *Repository) MarkReplyNotified(id int64) error {
-	_, err := r.db.Exec("UPDATE comments SET reply_notified_at=? WHERE id=? AND reply_notified_at=0", time.Now().Unix(), id)
+func (r *Repository) ClaimReplyNotification(id int64) (int64, bool, error) {
+	now := time.Now()
+	claim := -now.Unix()
+	staleBefore := -now.Add(-5 * time.Minute).Unix()
+	result, err := r.db.Exec(`UPDATE comments SET reply_notified_at=? WHERE id=? AND
+(reply_notified_at=0 OR (reply_notified_at<0 AND reply_notified_at>?))`, claim, id, staleBefore)
+	if err != nil {
+		return 0, false, err
+	}
+	affected, err := result.RowsAffected()
+	return claim, affected == 1, err
+}
+
+func (r *Repository) ReleaseReplyNotification(id, claim int64) error {
+	_, err := r.db.Exec("UPDATE comments SET reply_notified_at=0 WHERE id=? AND reply_notified_at=?", id, claim)
 	return err
 }
 
-func (r *Repository) ModerateComment(id int64, action string) error {
+func (r *Repository) MarkReplyNotified(id, claim int64) error {
+	result, err := r.db.Exec("UPDATE comments SET reply_notified_at=? WHERE id=? AND reply_notified_at=?", time.Now().Unix(), id, claim)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return errors.New("reply notification claim was lost")
+	}
+	return nil
+}
+
+func (r *Repository) ModerateComment(id int64, action string, notificationURLs ...string) error {
+	tx, err := r.db.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	switch action {
 	case "approve":
-		_, err := r.db.Exec("UPDATE comments SET status='approved',is_read=1,updated_at=? WHERE id=?", time.Now().Unix(), id)
-		return err
+		_, err = tx.Exec(r.db.Bind("UPDATE comments SET status='approved',is_read=1,updated_at=? WHERE id=?"), time.Now().Unix(), id)
+		if err == nil && len(notificationURLs) == 2 {
+			err = r.enqueueNotifications(tx, id, notificationURLs[0], notificationURLs[1], false, true)
+		}
 	case "pending":
-		_, err := r.db.Exec("UPDATE comments SET status='pending',updated_at=? WHERE id=?", time.Now().Unix(), id)
-		return err
+		_, err = tx.Exec(r.db.Bind("UPDATE comments SET status='pending',updated_at=? WHERE id=?"), time.Now().Unix(), id)
 	case "delete":
-		_, err := r.db.Exec("DELETE FROM comments WHERE id=?", id)
-		return err
+		_, err = tx.Exec(r.db.Bind("DELETE FROM comments WHERE id=?"), id)
 	default:
 		return errors.New("无效的评论操作")
 	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *Repository) SavePublicSettings(values map[string]string) error {
@@ -918,11 +1029,22 @@ func ParseTags(raw string) []Tag {
 }
 
 func ValidatePost(post Post) error {
-	if strings.TrimSpace(post.Title) == "" {
+	titleLength := len([]rune(strings.TrimSpace(post.Title)))
+	if titleLength == 0 {
 		return errors.New("标题不能为空")
 	}
-	if strings.TrimSpace(post.Slug) == "" {
+	if titleLength > 200 {
+		return errors.New("标题不能超过 200 个字符")
+	}
+	slugLength := len([]rune(strings.TrimSpace(post.Slug)))
+	if slugLength == 0 {
 		return errors.New("Slug 不能为空")
+	}
+	if slugLength > 180 {
+		return errors.New("Slug 不能超过 180 个字符")
+	}
+	if len([]rune(strings.TrimSpace(post.Excerpt))) > 500 {
+		return errors.New("摘要不能超过 500 个字符")
 	}
 	if post.Kind != "post" && post.Kind != "page" {
 		return fmt.Errorf("无效内容类型 %q", post.Kind)

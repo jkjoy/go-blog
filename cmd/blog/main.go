@@ -32,6 +32,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer application.Close()
+	application.StartNotifications()
 
 	server := &http.Server{
 		Addr:              cfg.Address,

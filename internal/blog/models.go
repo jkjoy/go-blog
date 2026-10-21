@@ -72,6 +72,12 @@ type User struct {
 	CreatedAt    int64
 }
 
+type Registration struct {
+	Username string
+	Nickname string
+	Email    string
+}
+
 func (u User) DisplayName() string {
 	if u.Nickname != "" {
 		return u.Nickname

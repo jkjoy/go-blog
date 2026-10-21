@@ -15,7 +15,6 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -104,6 +103,10 @@ func OpenDatabase(cfg Config, logger *slog.Logger) (*Database, error) {
 		}
 		logger.Info("initialized database schema", "dialect", dialect)
 	}
+	if err := result.Migrate(ctx, logger); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate database: %w", err)
+	}
 	if err := result.Validate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -169,7 +172,6 @@ func (d *Database) Bind(query string) string {
 }
 
 func (d *Database) EnsureInitialData(logger *slog.Logger) error {
-	now := time.Now().Unix()
 	defaults := map[string]string{
 		"site_name": "Go Blog", "site_tagline": "记录技术与生活",
 		"site_description": "一个使用 Go 构建的轻量博客", "site_footer": "© {year} Go Blog",
@@ -204,30 +206,6 @@ func (d *Database) EnsureInitialData(logger *slog.Logger) error {
 		}
 	}
 
-	var users int
-	if err := d.QueryRow("SELECT COUNT(*) FROM users").Scan(&users); err != nil {
-		return err
-	}
-	if users > 0 {
-		return nil
-	}
-	password, err := randomToken(15)
-	if err != nil {
-		return err
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return err
-	}
-	if _, err := d.Exec(
-		`INSERT INTO users(username,password_hash,nickname,email,avatar_url,website_url,signature,created_at,
-qq_url,wechat_url,weibo_url,x_url,telegram_url,mastodon_url,bilibili_url,instagram_url,tiktok_url)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		"admin", string(hash), "管理员", "", "", "", "", now, "", "", "", "", "", "", "", "", "",
-	); err != nil {
-		return err
-	}
-	logger.Warn("created the first administrator; store this password now", "username", "admin", "password", password)
 	return nil
 }
 

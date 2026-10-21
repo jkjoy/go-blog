@@ -1,6 +1,7 @@
 package blog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -14,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jkjoy/go-blog/web"
@@ -22,58 +24,68 @@ import (
 )
 
 type App struct {
-	cfg              Config
-	logger           *slog.Logger
-	version          string
-	database         *Database
-	repo             *Repository
-	auth             *Auth
-	markdown         *Markdown
-	templates        *template.Template
-	echo             *echo.Echo
-	loginIPRate      *rateLimiter
-	loginAccountRate *rateLimiter
-	commentBurstRate *rateLimiter
-	commentHourRate  *rateLimiter
-	aiRate           *rateLimiter
-	sendMail         mailSender
-	putObject        objectUploader
-	completeAI       aiCompleter
-	aiClient         *http.Client
+	cfg                Config
+	logger             *slog.Logger
+	version            string
+	database           *Database
+	repo               *Repository
+	auth               *Auth
+	markdown           *Markdown
+	templates          *template.Template
+	echo               *echo.Echo
+	loginIPRate        *rateLimiter
+	loginAccountRate   *rateLimiter
+	commentBurstRate   *rateLimiter
+	commentHourRate    *rateLimiter
+	aiRate             *rateLimiter
+	registerIPRate     *rateLimiter
+	sendMail           mailSender
+	putObject          objectUploader
+	completeAI         aiCompleter
+	aiClient           *http.Client
+	notificationMu     sync.Mutex
+	notificationCancel context.CancelFunc
+	notificationDone   chan struct{}
+	notificationWake   chan struct{}
+	notificationClosed bool
 }
 
 type PageData struct {
-	View          string
-	Title         string
-	Description   string
-	Canonical     string
-	Settings      SiteSettings
-	User          *User
-	NavPages      []Post
-	Posts         []Post
-	Post          Post
-	Comments      []Comment
-	CommentCount  int
-	CanComment    bool
-	AdminComments []AdminComment
-	Categories    []Category
-	Tags          []Tag
-	Links         []Link
-	Stats         DashboardStats
-	Mail          MailSettings
-	S3            S3Settings
-	AI            AISettings
-	AIReady       bool
-	Page          int
-	TotalPages    int
-	Total         int
-	Years         []ArchiveYear
-	Tag           Tag
-	Category      Category
-	Error         string
-	Notice        string
-	CSRF          string
-	Version       string
+	View             string
+	Title            string
+	Description      string
+	Canonical        string
+	Settings         SiteSettings
+	User             *User
+	NavPages         []Post
+	Posts            []Post
+	Post             Post
+	Comments         []Comment
+	CommentCount     int
+	CanComment       bool
+	AdminComments    []AdminComment
+	NotificationJobs []NotificationJob
+	Categories       []Category
+	Tags             []Tag
+	Links            []Link
+	Stats            DashboardStats
+	Mail             MailSettings
+	S3               S3Settings
+	AI               AISettings
+	AIReady          bool
+	FirstUser        bool
+	Registration     Registration
+	Page             int
+	TotalPages       int
+	Total            int
+	Years            []ArchiveYear
+	Tag              Tag
+	Category         Category
+	Link             Link
+	Error            string
+	Notice           string
+	CSRF             string
+	Version          string
 }
 
 type ArchiveYear struct {
@@ -113,11 +125,13 @@ func New(cfg Config, logger *slog.Logger, version string) (*App, error) {
 		return nil, fmt.Errorf("initialize tag metadata: %w", err)
 	}
 	app := &App{
-		cfg: cfg, logger: logger, version: version, database: database, repo: repo,
+		notificationWake: make(chan struct{}, 1),
+		cfg:              cfg, logger: logger, version: version, database: database, repo: repo,
 		auth: auth, markdown: NewMarkdown(), templates: templates,
 		loginIPRate: newRateLimiter(8, 5*time.Minute), loginAccountRate: newRateLimiter(20, 15*time.Minute),
 		commentBurstRate: newRateLimiter(5, time.Minute), commentHourRate: newRateLimiter(30, time.Hour),
-		aiRate: newRateLimiter(20, time.Minute), sendMail: sendSMTPMail, putObject: uploadS3Object,
+		aiRate: newRateLimiter(20, time.Minute), registerIPRate: newRateLimiter(5, time.Hour),
+		sendMail: sendSMTPMail, putObject: uploadS3Object,
 		completeAI: requestAICompletion, aiClient: &http.Client{Timeout: 75 * time.Second},
 	}
 	app.echo, err = app.routes()
@@ -128,7 +142,17 @@ func New(cfg Config, logger *slog.Logger, version string) (*App, error) {
 	return app, nil
 }
 
-func (a *App) Close() error          { return a.database.DB.Close() }
+func (a *App) Close() error {
+	a.notificationMu.Lock()
+	a.notificationClosed = true
+	cancel, done := a.notificationCancel, a.notificationDone
+	a.notificationMu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	return a.database.DB.Close()
+}
 func (a *App) Handler() http.Handler { return a.echo }
 
 func parseTemplates() (*template.Template, error) {
@@ -237,13 +261,19 @@ func (a *App) routes() (*echo.Echo, error) {
 	e.POST("/comments", a.submitComment)
 	e.GET("/login", a.loginPage)
 	e.POST("/login", a.login)
+	e.GET("/register", a.registerPage)
+	e.POST("/register", a.register)
 	e.POST("/logout", a.logout)
+	e.GET("/account", a.accountPage, a.requireUser)
+	e.POST("/account", a.saveAccount, a.requireUser)
 
 	admin := e.Group("/admin", a.requireAdmin)
 	admin.GET("", a.adminDashboard)
 	admin.GET("/posts", a.adminPosts)
 	admin.GET("/comments", a.adminComments)
 	admin.POST("/comments/:id", a.moderateComment)
+	admin.GET("/notifications", a.adminNotifications)
+	admin.POST("/notifications/:id/:kind/retry", a.retryNotification)
 	admin.GET("/categories", a.adminCategories)
 	admin.POST("/categories", a.saveCategory)
 	admin.POST("/categories/:id/delete", a.deleteCategory)
@@ -327,7 +357,7 @@ func (a *App) sessionMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		claims, err := a.auth.Claims(c.Request())
 		if err == nil {
-			if user, err := a.repo.UserByID(claims.UserID); err == nil {
+			if user, err := a.repo.UserByID(claims.UserID); err == nil && a.auth.ValidSessionUser(claims, user) {
 				c.Set("user", &user)
 				c.Set("claims", claims)
 			}
@@ -340,6 +370,9 @@ func (a *App) requireAdmin(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		user := currentUser(c)
 		if user == nil {
+			if isAdminAPIPath(c.Request().URL.Path) {
+				return echo.NewHTTPError(http.StatusUnauthorized, "登录已过期，请重新登录")
+			}
 			return c.Redirect(http.StatusSeeOther, "/login?next="+c.Request().URL.Path)
 		}
 		if !user.IsCreator {
@@ -377,6 +410,30 @@ func (a *App) requireAdmin(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+func (a *App) requireUser(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if currentUser(c) == nil {
+			return c.Redirect(http.StatusSeeOther, "/login?next="+url.QueryEscape(c.Request().URL.Path))
+		}
+		if c.Request().Method != http.MethodGet && c.Request().Method != http.MethodHead {
+			request := c.Request()
+			request.Body = http.MaxBytesReader(c.Response(), request.Body, 64<<10)
+			if err := request.ParseForm(); err != nil {
+				return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "账户表单不能超过 64KB")
+			}
+			claims, ok := c.Get("claims").(sessionClaims)
+			if !ok || !a.auth.ValidCSRF(claims, c.FormValue("csrf")) {
+				return echo.NewHTTPError(http.StatusForbidden, "请求校验失败，请刷新页面后重试")
+			}
+		}
+		return next(c)
+	}
+}
+
+func isAdminAPIPath(path string) bool {
+	return path == "/admin/ai" || path == "/admin/upload"
+}
+
 func currentUser(c echo.Context) *User {
 	user, _ := c.Get("user").(*User)
 	return user
@@ -398,6 +455,10 @@ func (a *App) httpError(err error, c echo.Context) {
 	}
 	if code >= 500 {
 		a.logger.Error("request failed", "error", err, "path", c.Request().URL.Path)
+	}
+	if isAdminAPIPath(c.Request().URL.Path) {
+		_ = c.JSON(code, map[string]string{"message": message})
+		return
 	}
 	data, dataErr := a.baseData(c, "出错了")
 	if dataErr == nil {
