@@ -176,7 +176,7 @@ func (d *Database) EnsureInitialData(logger *slog.Logger) error {
 		"site_name": "Go Blog", "site_tagline": "记录技术与生活",
 		"site_description": "一个使用 Go 构建的轻量博客", "site_footer": "© {year} Go Blog",
 		"posts_per_page": "6", "comments_enabled": "1", "comments_notify": "0", "comments_require_approval": "1",
-		"pretty_url": "1", "active_theme": "nebula",
+		"pretty_url": "1", "active_theme": "sunny",
 	}
 	for name, value := range defaults {
 		var count int

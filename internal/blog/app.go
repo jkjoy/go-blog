@@ -51,41 +51,46 @@ type App struct {
 }
 
 type PageData struct {
-	View             string
-	Title            string
-	Description      string
-	Canonical        string
-	Settings         SiteSettings
-	User             *User
-	NavPages         []Post
-	Posts            []Post
-	Post             Post
-	Comments         []Comment
-	CommentCount     int
-	CanComment       bool
-	AdminComments    []AdminComment
-	NotificationJobs []NotificationJob
-	Categories       []Category
-	Tags             []Tag
-	Links            []Link
-	Stats            DashboardStats
-	Mail             MailSettings
-	S3               S3Settings
-	AI               AISettings
-	AIReady          bool
-	FirstUser        bool
-	Registration     Registration
-	Page             int
-	TotalPages       int
-	Total            int
-	Years            []ArchiveYear
-	Tag              Tag
-	Category         Category
-	Link             Link
-	Error            string
-	Notice           string
-	CSRF             string
-	Version          string
+	View              string
+	Title             string
+	Description       string
+	Canonical         string
+	Settings          SiteSettings
+	SiteOwner         PublicProfile
+	SidebarTags       []Tag
+	SidebarCategories []Category
+	RecentComments    []PublicComment
+	SearchQuery       string
+	User              *User
+	NavPages          []Post
+	Posts             []Post
+	Post              Post
+	Comments          []Comment
+	CommentCount      int
+	CanComment        bool
+	AdminComments     []AdminComment
+	NotificationJobs  []NotificationJob
+	Categories        []Category
+	Tags              []Tag
+	Links             []Link
+	Stats             DashboardStats
+	Mail              MailSettings
+	S3                S3Settings
+	AI                AISettings
+	AIReady           bool
+	FirstUser         bool
+	Registration      Registration
+	Page              int
+	TotalPages        int
+	Total             int
+	Years             []ArchiveYear
+	Tag               Tag
+	Category          Category
+	Link              Link
+	Error             string
+	Notice            string
+	CSRF              string
+	Version           string
 }
 
 type ArchiveYear struct {
@@ -249,6 +254,7 @@ func (a *App) routes() (*echo.Echo, error) {
 	})
 
 	e.GET("/", a.home)
+	e.GET("/search", a.search)
 	e.GET("/page/:page", a.home)
 	e.GET("/archive/:slug", a.post)
 	e.GET("/archives", a.archives)
@@ -463,8 +469,9 @@ func (a *App) httpError(err error, c echo.Context) {
 	data, dataErr := a.baseData(c, "出错了")
 	if dataErr == nil {
 		data.View, data.Error = "error", message
-		_ = a.render(c, code, "public", data)
-		return
+		if renderErr := a.render(c, code, "public", data); renderErr == nil || c.Response().Committed {
+			return
+		}
 	}
 	_ = c.String(code, message)
 }

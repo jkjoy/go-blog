@@ -72,6 +72,23 @@ type User struct {
 	CreatedAt    int64
 }
 
+// PublicProfile contains only the creator's public identity.
+type PublicProfile struct {
+	ID        int64
+	Name      string
+	AvatarURL string
+	Signature string
+}
+
+type PublicComment struct {
+	ID         int64
+	AuthorName string
+	Content    string
+	CreatedAt  int64
+	PostSlug   string
+	PostKind   string
+}
+
 type Registration struct {
 	Username string
 	Nickname string

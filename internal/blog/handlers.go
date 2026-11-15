@@ -49,6 +49,11 @@ func (a *App) baseData(c echo.Context, title string) (PageData, error) {
 }
 
 func (a *App) render(c echo.Context, status int, name string, data PageData) error {
+	if name == "public" || name == "auth" {
+		if err := a.loadPublicData(&data); err != nil {
+			return err
+		}
+	}
 	c.Response().Header().Set(echo.HeaderContentType, echo.MIMETextHTMLCharsetUTF8)
 	c.Response().WriteHeader(status)
 	return a.templates.ExecuteTemplate(c.Response(), name, data)

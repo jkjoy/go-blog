@@ -1,11 +1,12 @@
 # Go Blog
 
-一个可打包为单个可执行文件的轻量博客。前台参考 Nebula 主题，支持深浅主题、星空背景、文章归档、标签、分类、友链、评论和响应式布局。
+一个可打包为单个可执行文件的轻量博客。前台复刻 [Sunny](https://github.com/jkjoy/cfblog-theme-sunny) 的 SunnyLite 风格，采用居中站点头像、文章信息流和双栏布局，支持深浅模式、文章搜索、归档、标签、分类、友链、评论和响应式布局。
 
 ## 当前功能
 
 - 新站注册、账户资料和密码管理；首位注册用户自动成为站点创建者
 - 首页、文章、独立页面、归档、标签、分类和友链
+- Sunny 前台与登录／注册页面、站内搜索、最新评论侧栏、文章目录和代码复制
 - Goldmark Markdown 渲染与 HTML 白名单清理
 - 评论、嵌套回复、审核、SMTP 邮件通知和浏览计数
 - RSS 2.0 和 Sitemap
@@ -17,6 +18,12 @@
 - SQLite、PostgreSQL 和 MySQL/MariaDB 数据库驱动
 - 启动时自动执行版本化数据库迁移
 - 模板、CSS 和 JavaScript 通过 `go:embed` 嵌入程序
+
+## 前台主题
+
+当前前台统一使用 Sunny，参考仓库为 [jkjoy/cfblog-theme-sunny](https://github.com/jkjoy/cfblog-theme-sunny)，由 Go 模板、本站 CSS 和原生 JavaScript 适配实现。主题资源随可执行文件内嵌，无需 Astro、WordPress、jQuery 或第三方脚本 CDN。后台管理界面继续使用原有样式。
+
+主题默认浅色，可通过导航中的太阳／月亮按钮切换，偏好保存在当前浏览器。桌面显示搜索、标签和最新评论侧栏；窄屏使用单栏，手机使用底部工具栏和抽屉导航。文章与独立页面均使用 Sunny 阅读布局。后台尚未提供多主题切换入口。
 
 ## 构建
 
